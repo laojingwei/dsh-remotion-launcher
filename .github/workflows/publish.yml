@@ -1,32 +1,49 @@
 name: publish
 
-# 打 tag 就发 npm（v1.0.1 → 1.0.1）
+# 发版方式：推一个 v* 标签，或者手动 Run workflow。
+# 优先用 npm 的 trusted publishing（OIDC）发布，仓库里可以完全不存 token；
+# 如果也配了 NPM_TOKEN secret，会一起带上，两种方式都能发。
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
+  id-token: write          # 换 OIDC 令牌就靠它，缺了 --provenance 必失败
 
 jobs:
-  npm:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # trusted publishing 要求 npm >= 11.5.1，runner 自带的版本不够新
+      - name: 升级 npm
+        run: npm install -g npm@latest && npm --version
 
       # tag 和 package.json 版本必须一致，否则会发出版本对不上的包
-      - name: 校验 tag 与 package.json 版本
+      - name: 核对 package.json 版本与 tag
         run: |
-          pkg="$(node -p "require('./package.json').version")"
-          tag="${GITHUB_REF_NAME#v}"
-          echo "package.json = $pkg, tag = $tag"
-          if [ "$pkg" != "$tag" ]; then
-            echo "::error::tag v$tag 与 package.json $pkg 不一致，请先 npm version"
+          PKG=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "package.json = $PKG | tag = $TAG"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$PKG" != "$TAG" ]; then
+            echo "::error::package.json 的版本 ($PKG) 和 tag ($TAG) 对不上，先改版本号再打 tag"
+            exit 1
+          fi
+
+      - name: 该版本是否已发布
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "dsh-remotion-launcher@$V" version > /dev/null 2>&1; then
+            echo "::error::npm 上已经有 $V 了，改完代码记得升版本"
             exit 1
           fi
 
@@ -40,7 +57,24 @@ jobs:
       - name: 确认包内容
         run: npm pack --dry-run 2>&1 | tail -12
 
-      - name: 发布到 npm
-        run: npm publish --access public
+      - name: 发布
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # npm publish 在「只允许暂存」的 trust 下也会返回 0，包却只进了暂存区。
+      # 所以必须回查一次 registry，查不到就算失败，别让 CI 绿灯骗人。
+      # 实测 registry 生效要几分钟，所以给足 5 分钟。
+      - name: 确认真的发布出去了
+        run: |
+          V=$(node -p "require('./package.json').version")
+          for i in $(seq 1 30); do
+            if npm view "dsh-remotion-launcher@$V" version > /dev/null 2>&1; then
+              echo "✅ registry 上已有 $V"
+              exit 0
+            fi
+            echo "第 $i 次查询还没出现，10 秒后重试"
+            sleep 10
+          done
+          echo "::error::发布步骤返回成功，但 5 分钟内 registry 上一直查不到 $V。若日志里出现 staged 字样，说明 Trusted Publisher 的 Allowed actions 没允许直接发布，版本停在了暂存区，需要在 npm 网页批准或重建 trust。"
+          exit 1
