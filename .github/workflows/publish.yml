@@ -1,0 +1,46 @@
+name: publish
+
+# 打 tag 就发 npm（v1.0.1 → 1.0.1）
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      # tag 和 package.json 版本必须一致，否则会发出版本对不上的包
+      - name: 校验 tag 与 package.json 版本
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "package.json = $pkg, tag = $tag"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag v$tag 与 package.json $pkg 不一致，请先 npm version"
+            exit 1
+          fi
+
+      # 纯 JS，无依赖、无构建产物；顺手跑一下离线自检
+      - name: 离线自检
+        run: |
+          node --check index.js
+          cp client.js /tmp/client.cjs && node --check /tmp/client.cjs
+          node scripts/smoke.mjs
+
+      - name: 确认包内容
+        run: npm pack --dry-run 2>&1 | tail -12
+
+      - name: 发布到 npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
