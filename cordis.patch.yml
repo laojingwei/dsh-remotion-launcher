@@ -1,0 +1,12 @@
+# dsh-remotion-launcher —— 把本插件的一行挂进 DSH 的组合树。
+#
+# 安装（三选一，详见 README）：
+#   npm：      dsh plugin --profile web add dsh-remotion-launcher
+#   GitHub：   dsh plugin --profile web add github:<你>/dsh-remotion-launcher
+#   DSH 界面： 设置 → 插件 → 添加插件 → 填包名或地址
+#
+# 本插件不含工程。装好后在面板「工程 → 安装 / 更换」里选一个已有工程目录，
+# 或者从 npm 下载一份；也可以用环境变量 REMOTION_STUDIO_ROOT 指定。
+- insert:
+    - id: dsh-remotion-launcher
+      name: dsh-remotion-launcher

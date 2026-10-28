@@ -1,0 +1,57 @@
+{
+  "name": "dsh-remotion-launcher",
+  "version": "1.0.0",
+  "description": "在 DeepSeek Harness 里一键构建 / 启动 / 停止 Remotion Studio 动画工程（含日志、健康检查与工程下载）",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "scripts"
+  ],
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs",
+    "host-sim": "node scripts/host-sim.mjs",
+    "check:encoding": "node scripts/check-encoding.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "comment": "不声明 peerDependencies：host 走 DSH 运行时注入，client 走 window.__ModuleLoader__ 的白名单 require，都不需要 npm 解析 DSH 包。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "remotion"
+  ],
+  "author": "laojingwei",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laojingwei/dsh-remotion-launcher.git"
+  },
+  "homepage": "https://github.com/laojingwei/dsh-remotion-launcher#readme",
+  "bugs": {
+    "url": "https://github.com/laojingwei/dsh-remotion-launcher/issues"
+  }
+}
