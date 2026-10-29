@@ -91,6 +91,7 @@ window.__ModuleLoader__.load({
         background: 'rgba(255,255,255,0.02)',
       },
       titleWrap: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 },
+      headActions: { display: 'flex', alignItems: 'center', gap: 2, flex: '0 0 auto' },
       title: { fontWeight: 600, fontSize: 13, letterSpacing: 0.2, color: C.text },
       subtitle: { color: C.faint, fontSize: 11, fontFamily: C.mono },
       close: {
@@ -322,6 +323,14 @@ window.__ModuleLoader__.load({
       /** 安装/更换工程卡片是否展开（没工程时自动展开） */
       const [showInstall, setShowInstall] = React.useState(false);
       const installAutoShownRef = React.useRef(false);
+      /** 已经处理过的「安装成功」时间戳，避免同一结果把卡片反复关掉 */
+      const installDoneRef = React.useRef(null);
+      /** 检查更新 */
+      const [showUpdates, setShowUpdates] = React.useState(false);
+      const [checking, setChecking] = React.useState(false);
+      const [updates, setUpdates] = React.useState(null);
+      const [updatingPlugin, setUpdatingPlugin] = React.useState(false);
+      const [pluginMsg, setPluginMsg] = React.useState(null);
       /** 下载源用自绘下拉（原生 select 的选项列表跟深色面板冲突，字看不清） */
       const [registryMenuOpen, setRegistryMenuOpen] = React.useState(false);
       const [hoverReg, setHoverReg] = React.useState(null);
@@ -410,8 +419,14 @@ window.__ModuleLoader__.load({
           installAutoShownRef.current = true;
           if (!data.projectValid) setShowInstall(true);
         }
-        // 安装成功后收起卡片，目录清空（下次换工程重新选）
-        if (showInstall && data.install && data.install.status === 'success') {
+        // 安装成功后收起卡片，目录清空（下次换工程重新选）。
+        // 注意：host 那边 install.status 成功后会一直停在 success，所以必须用
+        // finishedAt 去重 —— 否则用户之后每次点「更换」，卡片都会被这里立刻关掉
+        //（表现就是「一闪而过，一直打不开」）。
+        const done = data.install;
+        if (showInstall && done && done.status === 'success' && done.finishedAt
+          && done.finishedAt !== installDoneRef.current) {
+          installDoneRef.current = done.finishedAt;
           setShowInstall(false);
           setInstallDir('');
         }
@@ -613,6 +628,64 @@ window.__ModuleLoader__.load({
         }
       };
 
+      /* ── 检查更新 ── */
+
+      const checkUpdates = React.useCallback(async () => {
+        setChecking(true);
+        setError(null);
+        try {
+          const res = await fetch(`${API}/updates?registry=${encodeURIComponent(effectiveRegistry)}`);
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+          setUpdates(body);
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setChecking(false);
+        }
+      }, [effectiveRegistry]);
+
+      /** 插件自己的更新：交给 DSH 的 pluginManager Remote，别自己 spawn dsh */
+      const updatePlugin = async () => {
+        setUpdatingPlugin(true);
+        setPluginMsg(null);
+        try {
+          const pm = clientCtx && clientCtx.remote && clientCtx.remote.pluginManager;
+          if (!pm || typeof pm.installBundle !== 'function') {
+            setPluginMsg('这个 DSH 版本没有插件管理接口，请到「设置 → 插件」里更新后重启');
+            return;
+          }
+          const name = (updates && updates.plugin && updates.plugin.name) || 'dsh-remotion-launcher';
+          await pm.installBundle(`${name}@latest`, {});
+          setPluginMsg('已更新，重启 DSH 生效');
+          await pullRef.current();
+        } catch (e) {
+          setPluginMsg(`更新失败：${e && e.message ? e.message : String(e)}（可在「设置 → 插件」里卸载重装）`);
+        } finally {
+          setUpdatingPlugin(false);
+        }
+      };
+
+      /** 工程更新：走 host 的原地更新（保留 data/public/out） */
+      const runProjectUpdate = async () => {
+        setBusy(true);
+        setError(null);
+        try {
+          const res = await fetch(`${API}/update-project`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ registry: effectiveRegistry }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+          await pullRef.current();
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setBusy(false);
+        }
+      };
+
       /* 拖动标题栏：面板自己走，和悬浮按钮各管各的位置 */
       const onPanelHeadDown = (event) => {
         if (event.button !== 0 && event.pointerType === 'mouse') return;
@@ -665,7 +738,19 @@ window.__ModuleLoader__.load({
       const projectValid = Boolean(data && data.projectValid);
       const installState = (data && data.install) || {};
       const installing = installState.status === 'running';
+      const projectUpdate = (data && data.projectUpdate) || {};
+      const updatingProject = projectUpdate.status === 'running';
       const projectPackage = (data && data.projectPackage) || 'remotion-studio-mcp';
+
+      /** 打开更新面板时顺便查一次；和安装卡片互斥 */
+      const toggleUpdates = () => {
+        const next = !showUpdates;
+        setShowUpdates(next);
+        if (next) {
+          setShowInstall(false);
+          if (!updates && !checking) void checkUpdates();
+        }
+      };
 
       const isExternal = server.status === 'external';
       const serverBusy = server.status === 'starting' || server.status === 'stopping';
@@ -781,10 +866,22 @@ window.__ModuleLoader__.load({
             h('span', { style: S.title, key: 't' }, 'Remotion Studio'),
             h('span', { style: S.subtitle, key: 's' }, `:${(data && data.port) || '—'}`),
           ]),
-          h('button', {
-            style: S.close, key: 'x', title: '收起', 'aria-label': '收起',
-            onClick: () => setOpen(false),
-          }, '×'),
+          h('div', { key: 'ha', style: S.headActions }, [
+            h('button', {
+              key: 'u',
+              style: {
+                ...S.close,
+                ...(showUpdates ? { color: C.text, background: 'rgba(255,255,255,0.10)' } : {}),
+              },
+              title: '检查更新',
+              'aria-label': '检查更新',
+              onClick: toggleUpdates,
+            }, '⟳'),
+            h('button', {
+              style: S.close, key: 'x', title: '收起', 'aria-label': '收起',
+              onClick: () => setOpen(false),
+            }, '×'),
+          ]),
         ]),
 
         h('div', { style: S.body, key: 'body' }, [
@@ -801,11 +898,86 @@ window.__ModuleLoader__.load({
             }, projectValid ? ((data && data.projectRoot) || '已就绪') : '未安装'),
             h(ActButton, {
               variant: 'port',
-              disabled: busy || installing,
+              disabled: busy || installing || updatingProject,
               title: projectValid ? '换一个工程目录（会重新下载安装）' : '选择目录并下载工程',
-              onClick: () => setShowInstall((v) => !v),
+              onClick: () => {
+                setShowInstall((v) => !v);
+                setShowUpdates(false);
+              },
             }, showInstall ? '收起' : (projectValid ? '更换' : '安装')),
           ]),
+
+          /* 检查更新：启动器和工程各查一次 npm 上的 latest */
+          showUpdates ? h('div', { key: 'upd', style: S.installCard }, [
+            h('div', { key: 't', style: S.installTitle }, '检查更新'),
+            h('div', { key: 'h', style: S.installHint },
+              `从 npm 查最新版本，源：${registryChoice === 'custom' ? (customRegistry.trim() || '未填') : registryChoice}`),
+
+            h('div', { key: 'acts', style: S.actions }, [
+              h(ActButton, {
+                variant: 'default',
+                disabled: checking,
+                title: '重新查询两个包的最新版本',
+                onClick: checkUpdates,
+              }, checking ? '查询中…' : '检查更新'),
+            ]),
+
+            updates ? h('div', { key: 'list', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, [
+              h('div', { key: 'p', style: S.row }, [
+                h('span', { style: S.label }, '启动器'),
+                h('span', {
+                  style: {
+                    ...S.value, flex: '1 1 auto', minWidth: 0,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  },
+                  title: `${updates.plugin.current} → ${updates.plugin.latest ?? '查询失败'}`,
+                }, updates.plugin.latest && updates.plugin.latest !== updates.plugin.current
+                  ? `${updates.plugin.current} → ${updates.plugin.latest}`
+                  : `${updates.plugin.current}${updates.plugin.latest ? '（已最新）' : '（没有查到）'}`),
+                h(ActButton, {
+                  variant: 'port',
+                  disabled: updatingPlugin || !updates.plugin.latest
+                    || updates.plugin.latest === updates.plugin.current,
+                  title: '更新后需要重启 DSH',
+                  onClick: updatePlugin,
+                }, updatingPlugin ? '…' : '更新'),
+              ]),
+
+              h('div', { key: 'j', style: S.row }, [
+                h('span', { style: S.label }, '工程'),
+                h('span', {
+                  style: {
+                    ...S.value, flex: '1 1 auto', minWidth: 0,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  },
+                  title: `${updates.project.current ?? '未知'} → ${updates.project.latest ?? '查询失败'}`,
+                }, updates.project.latest && updates.project.latest !== updates.project.current
+                  ? `${updates.project.current ?? '未知'} → ${updates.project.latest}`
+                  : `${updates.project.current ?? '未知'}${updates.project.latest ? '（已最新）' : '（没有查到）'}`),
+                h(ActButton, {
+                  variant: 'port',
+                  disabled: busy || updatingProject || !updates.project.current || !projectValid
+                    || !updates.project.latest || updates.project.latest === updates.project.current,
+                  title: '原地更新代码文件，保留 data / public / out',
+                  onClick: runProjectUpdate,
+                }, updatingProject ? '…' : '更新'),
+              ]),
+
+              !updates.plugin.latest || !updates.project.latest
+                ? h('div', { key: 'warn', style: S.installHint }, '有版本没查到（网络不通或包名不对，也可能是镜像还没同步）')
+                : null,
+            ]) : null,
+
+            pluginMsg ? h('div', { key: 'm', style: S.installHint }, pluginMsg) : null,
+
+            updatingProject
+              ? h('div', { key: 'rt', style: S.installHint }, '正在更新工程，进度见下方日志…')
+              : projectUpdate.status === 'failed'
+                ? h('div', { key: 'rf', style: S.err }, projectUpdate.error || '更新失败')
+                : projectUpdate.status === 'success'
+                  ? h('div', { key: 'rs', style: S.installHint }, `已更新到 ${projectUpdate.to}，重启服务后生效`)
+                  : null,
+          ]) : null,
 
           /* 安装 / 更换工程：可以直接用已有目录，也可以从 npm 下载 */
           showInstall ? h('div', { key: 'install', style: S.installCard }, [

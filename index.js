@@ -83,6 +83,43 @@ const PROJECT_PACKAGE = process.env.REMOTION_PROJECT_PACKAGE ?? 'remotion-studio
 /** 下载源：官方 / 国内镜像 / 自定义 */
 const DEFAULT_REGISTRY = 'https://registry.npmmirror.com'
 
+/** 插件自身版本：读自己的 package.json，别写死 */
+const PLUGIN_PACKAGE = 'dsh-remotion-launcher'
+const PLUGIN_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'))
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
+
+/** 当前工程目录里 package.json 的版本 */
+function readProjectVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'))
+    return typeof pkg.version === 'string' ? pkg.version : null
+  } catch {
+    return null
+  }
+}
+
+/** 问 registry 要某个包的最新版本（`<registry>/<pkg>/latest`，比 `npm view` 轻） */
+async function fetchLatestVersion(pkgName, registry) {
+  try {
+    const base = registry.replace(/\/+$/, '')
+    const res = await fetch(`${base}/${encodeURIComponent(pkgName)}/latest`, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+    return typeof data.version === 'string' ? data.version : null
+  } catch {
+    return null
+  }
+}
+
 const MAX_LOGS = 600
 
 /**
@@ -164,6 +201,8 @@ let build = { status: 'idle', startedAt: null, finishedAt: null, code: null }
 let server = { status: 'idle', startedAt: null, lastError: null, pid: null }
 /** 下载 / 安装工程的进度（npm pack → 解压 → npm install） */
 let install = { status: 'idle', dir: null, registry: null, startedAt: null, finishedAt: null, error: null }
+/** 原地更新工程（覆盖代码文件，保留 data/public/out/node_modules） */
+let projectUpdate = { status: 'idle', from: null, to: null, startedAt: null, finishedAt: null, error: null }
 let buildProc = null
 let serverProc = null
 let lastHealthy = false
@@ -361,6 +400,70 @@ async function installProject({ dir, registry }) {
   }
 }
 
+/* ── 原地更新工程 ───────────────────────────────────────────────── */
+
+/** 更新时绝不覆盖的目录：用户数据 + 依赖 + git */
+const UPDATE_KEEP = new Set(['data', 'public', 'out', 'node_modules', 'dist', '.git', '.github'])
+
+/**
+ * 原地更新：下载新版 → 解压到临时目录 → 覆盖代码文件 → npm install。
+ * 不做「整目录替换」，否则用户的 data/（工程、素材、历史）会被一起抹掉。
+ */
+async function updateProject({ registry }) {
+  projectUpdate = {
+    status: 'running', from: readProjectVersion(), to: null,
+    startedAt: Date.now(), finishedAt: null, error: null,
+  }
+  const tmp = path.join(STATE_DIR, `update-${Date.now()}`)
+  try {
+    fs.mkdirSync(tmp, { recursive: true })
+    pushLog('install', `▸ 更新工程：下载 ${PROJECT_PACKAGE}@latest（源：${registry}）`)
+
+    const packCode = await runStep('npm pack', 'npm', [
+      'pack', `${PROJECT_PACKAGE}@latest`, `--registry=${registry}`, '--pack-destination', tmp,
+    ])
+    if (packCode !== 0) throw new Error('下载失败（npm pack 非 0 退出）')
+
+    const tgz = fs.readdirSync(tmp).find((file) => file.endsWith('.tgz'))
+    if (!tgz) throw new Error('npm pack 没有产出 .tgz')
+
+    const work = path.join(tmp, 'x')
+    fs.mkdirSync(work, { recursive: true })
+    const unpackCode = await runStep('解压', 'tar', [
+      '-xzf', path.join(tmp, tgz), '-C', work, '--strip-components=1',
+    ])
+    if (unpackCode !== 0) throw new Error('解压失败')
+
+    let count = 0
+    for (const entry of fs.readdirSync(work, { withFileTypes: true })) {
+      if (UPDATE_KEEP.has(entry.name)) continue
+      fs.cpSync(path.join(work, entry.name), path.join(projectRoot, entry.name), {
+        recursive: true, force: true,
+      })
+      count += 1
+    }
+    pushLog('install', `▸ 覆盖 ${count} 项代码文件（data / public / out / node_modules 不动）`)
+
+    projectUpdate.to = readProjectVersion()
+    pushLog('install', '▸ 更新依赖（几分钟）')
+    const npmCode = await runStep('npm install', 'npm', [
+      'install', `--registry=${registry}`, '--no-audit', '--no-fund',
+    ], { cwd: projectRoot })
+    if (npmCode !== 0) throw new Error('npm install 非 0 退出（依赖可能不完整）')
+
+    projectUpdate = { ...projectUpdate, status: 'success', finishedAt: Date.now(), error: null }
+    sys(`工程已更新：${projectUpdate.from ?? '?'} → ${projectUpdate.to ?? '?'}（重启服务后生效）`)
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    projectUpdate = { ...projectUpdate, status: 'failed', finishedAt: Date.now(), error: message }
+    sys(`更新工程失败：${message}`)
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    } catch { /* ignore */ }
+  }
+}
+
 /* ── 构建 ───────────────────────────────────────────────────────── */
 
 function startBuild() {
@@ -503,6 +606,8 @@ function snapshot(sinceSeq) {
     projectPackage: PROJECT_PACKAGE,
     defaultRegistry: DEFAULT_REGISTRY,
     install: { ...install },
+    projectUpdate: { ...projectUpdate },
+    pluginVersion: PLUGIN_VERSION,
     port,
     url: baseUrl(),
     healthy: lastHealthy,
@@ -606,6 +711,34 @@ async function handle(req, res) {
       if (!/^https?:\/\//i.test(registry)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
       // 异步跑，客户端靠轮询 state 看进度
       void installProject({ dir, registry })
+      return reply(200, { ok: true, ...snapshot(0) })
+    }
+    if (action === '/updates' && method === 'GET') {
+      const registry = (url.searchParams.get('registry') || DEFAULT_REGISTRY).trim()
+      if (!/^https?:\/\//i.test(registry)) {
+        return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
+      }
+      const [pluginLatest, projectLatest] = await Promise.all([
+        fetchLatestVersion(PLUGIN_PACKAGE, registry),
+        fetchLatestVersion(PROJECT_PACKAGE, registry),
+      ])
+      return reply(200, {
+        ok: true,
+        registry,
+        plugin: { name: PLUGIN_PACKAGE, current: PLUGIN_VERSION, latest: pluginLatest },
+        project: { name: PROJECT_PACKAGE, current: readProjectVersion(), latest: projectLatest },
+      })
+    }
+    if (action === '/update-project' && method === 'POST') {
+      const body = await readJsonBody(req)
+      const registry = String((body && body.registry) ?? DEFAULT_REGISTRY).trim()
+      if (!/^https?:\/\//i.test(registry)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
+      if (projectUpdate.status === 'running' || install.status === 'running') {
+        return reply(409, { ok: false, error: '正在安装/更新工程，请稍候' })
+      }
+      if (serverProc) return reply(409, { ok: false, error: '服务运行中，先停止再更新工程' })
+      if (!projectValid()) return reply(409, { ok: false, error: '还没有工程，先用「安装」' })
+      void updateProject({ registry })
       return reply(200, { ok: true, ...snapshot(0) })
     }
     if (action === '/stop' && method === 'POST') {

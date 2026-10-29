@@ -187,6 +187,17 @@ check('GET /state 带工程/下载相关字段', () => {
   console.log(`      工程有效：${body.projectValid}  包名：${body.projectPackage}`)
 })
 
+/* ── 检查更新：走真实 registry，但网络失败也算通过（只断言结构） ── */
+const updates = await request('GET', '/remotion-plugin/updates')
+check('GET /updates 返回启动器与工程的版本', () => {
+  if (updates.status !== 200) throw new Error(`HTTP ${updates.status} ${updates.body}`)
+  const body = JSON.parse(updates.body)
+  if (!body.plugin || !body.project) throw new Error('缺 plugin / project')
+  if (typeof body.plugin.current !== 'string') throw new Error('plugin.current 不是字符串')
+  console.log(`      启动器 ${body.plugin.current} → ${body.plugin.latest ?? '（查询失败/离线）'}`)
+  console.log(`      工程   ${body.project.current ?? '—'} → ${body.project.latest ?? '（查询失败/离线）'}`)
+})
+
 /* ── 换工程目录：只测校验，不真的切 ── */
 const useMissing = await request('POST', '/remotion-plugin/use-project', JSON.stringify({ dir: '' }))
 check('POST /use-project 缺目录返回 400', () => {
