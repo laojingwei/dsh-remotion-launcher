@@ -29,6 +29,8 @@ window.__ModuleLoader__.load({
     const DRAG_THRESHOLD = 4;
     /** apply() 里存下来的 client Context，用来调 DSH 的目录选择器 */
     let clientCtx = null;
+    /** 动态注入拿到的插件管理接口；服务不存在时为 null */
+    let pluginManager = null;
 
     const REGISTRY_CHOICES = [
       { value: 'https://registry.npmmirror.com', label: '国内镜像 npmmirror' },
@@ -650,9 +652,9 @@ window.__ModuleLoader__.load({
         setUpdatingPlugin(true);
         setPluginMsg(null);
         try {
-          const pm = clientCtx && clientCtx.remote && clientCtx.remote.pluginManager;
+          const pm = pluginManager;
           if (!pm || typeof pm.installBundle !== 'function') {
-            setPluginMsg('这个 DSH 版本没有插件管理接口，请到「设置 → 插件」里更新后重启');
+            setPluginMsg('当前 DSH 没有暴露插件管理接口，请到「设置 → 插件」里更新，然后重启 DSH');
             return;
           }
           const name = (updates && updates.plugin && updates.plugin.name) || 'dsh-remotion-launcher';
@@ -1163,6 +1165,27 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       clientCtx = ctx;
+
+      /**
+       * 动态拿插件管理接口。
+       *
+       * 不能写进 `exports.inject`：那会让插件等这个服务就绪才加载，某个部署
+       * 没装插件管理页时整个面板就永远不出现 —— 为一个「检查更新」按钮赌上全部不划算。
+       * `ctx.inject` 是按需注入：服务在就回调，不在就跳过，不阻塞。
+       */
+      try {
+        ctx.inject(['remote.pluginManager'], (svcCtx) => {
+          try {
+            pluginManager = svcCtx.remote.pluginManager;
+          } catch {
+            pluginManager = null;
+          }
+          return () => { pluginManager = null; };
+        });
+      } catch {
+        /* 环境不支持动态注入：保持 null，面板里会提示手动更新 */
+      }
+
       ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',
         id: 'remotion-launcher',
