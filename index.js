@@ -93,6 +93,13 @@ const PLUGIN_VERSION = (() => {
     return '0.0.0'
   }
 })()
+/**
+ * 插件是怎么装的：
+ *  · 'npm'  —— 在 node_modules 里，版本跟随 registry，可以「检查更新」
+ *  · 'link' —— 直接指向源码目录，版本取决于那份源码；npm 发了新版也不会变，
+ *              必须卸载后重装 npm 版才生效
+ */
+const PLUGIN_SOURCE = PLUGIN_DIR.includes(`${path.sep}node_modules${path.sep}`) ? 'npm' : 'link'
 
 /** 当前工程目录里 package.json 的版本 */
 function readProjectVersion() {
@@ -608,6 +615,7 @@ function snapshot(sinceSeq) {
     install: { ...install },
     projectUpdate: { ...projectUpdate },
     pluginVersion: PLUGIN_VERSION,
+    pluginSource: PLUGIN_SOURCE,
     port,
     url: baseUrl(),
     healthy: lastHealthy,

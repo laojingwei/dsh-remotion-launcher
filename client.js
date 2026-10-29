@@ -658,8 +658,28 @@ window.__ModuleLoader__.load({
             return;
           }
           const name = (updates && updates.plugin && updates.plugin.name) || 'dsh-remotion-launcher';
-          await pm.installBundle(`${name}@latest`, {});
-          setPluginMsg('已更新，重启 DSH 生效');
+          const result = await pm.installBundle(`${name}@latest`, {});
+
+          /**
+           * installBundle 永远不 reject：失败也会 resolve 成
+           * { application: 'failed', error: { code } }（plugin-manager 的 change() 把异常吞了）。
+           * 不看返回值的话，「已经装过」这种拒绝也会被当成更新成功。
+           */
+          if (result && result.application === 'failed') {
+            const code = (result.error && result.error.code) || 'unknown';
+            if (code === 'already-installed') {
+              setPluginMsg('这个 profile 开着 HMR，不允许原地覆盖已安装的插件：请到「设置 → 插件」先卸载，再安装最新版');
+            } else {
+              setPluginMsg(`更新失败（${code}）：请到「设置 → 插件」里卸载后重装`);
+            }
+            return;
+          }
+
+          const version = (result && result.version)
+            || (updates && updates.plugin && updates.plugin.latest) || '?';
+          setPluginMsg(result && result.application === 'applied'
+            ? `已更新到 ${version}，刷新页面即可`
+            : `已更新到 ${version}，需要重启 DSH 才生效`);
           await pullRef.current();
         } catch (e) {
           setPluginMsg(`更新失败：${e && e.message ? e.message : String(e)}（可在「设置 → 插件」里卸载重装）`);
@@ -743,6 +763,8 @@ window.__ModuleLoader__.load({
       const projectUpdate = (data && data.projectUpdate) || {};
       const updatingProject = projectUpdate.status === 'running';
       const projectPackage = (data && data.projectPackage) || 'remotion-studio-mcp';
+      /** 'npm' = 装在 node_modules 里，能跟随 registry；'link' = 指向源码目录，更新要看源码 */
+      const pluginSource = (data && data.pluginSource) || 'unknown';
 
       /** 打开更新面板时顺便查一次；和安装卡片互斥 */
       const toggleUpdates = () => {
@@ -932,17 +954,23 @@ window.__ModuleLoader__.load({
                     ...S.value, flex: '1 1 auto', minWidth: 0,
                     overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                   },
-                  title: `${updates.plugin.current} → ${updates.plugin.latest ?? '查询失败'}`,
-                }, updates.plugin.latest && updates.plugin.latest !== updates.plugin.current
-                  ? `${updates.plugin.current} → ${updates.plugin.latest}`
-                  : `${updates.plugin.current}${updates.plugin.latest ? '（已最新）' : '（没有查到）'}`),
+                  title: pluginSource === 'link'
+                    ? `本地链接安装（${updates.plugin.current}），版本来自源码目录，不跟随 npm`
+                    : `${updates.plugin.current} → ${updates.plugin.latest ?? '查询失败'}`,
+                }, pluginSource === 'link'
+                  ? `${updates.plugin.current}（本地链接）`
+                  : updates.plugin.latest && updates.plugin.latest !== updates.plugin.current
+                    ? `${updates.plugin.current} → ${updates.plugin.latest}`
+                    : `${updates.plugin.current}${updates.plugin.latest ? '（已最新）' : '（没有查到）'}`),
                 h(ActButton, {
                   variant: 'port',
-                  disabled: updatingPlugin || !updates.plugin.latest
+                  disabled: pluginSource === 'link' || updatingPlugin || !updates.plugin.latest
                     || updates.plugin.latest === updates.plugin.current,
-                  title: '更新后需要重启 DSH',
+                  title: pluginSource === 'link'
+                    ? '当前是 link 安装：改源码，或先在「设置 → 插件」卸载再装 npm 版'
+                    : '更新后需要重启 DSH',
                   onClick: updatePlugin,
-                }, updatingPlugin ? '…' : '更新'),
+                }, pluginSource === 'link' ? '链接版' : (updatingPlugin ? '…' : '更新')),
               ]),
 
               h('div', { key: 'j', style: S.row }, [
