@@ -353,6 +353,21 @@ window.__ModuleLoader__.load({
       return null;
     }
 
+    /** 「已装好新版，重启生效」这条提示被关掉时记下版本号，同一个版本不再打扰 */
+    const RESTART_ACK_KEY = 'dsh-remotion-launcher.restartAck';
+
+    function loadRestartAck() {
+      try {
+        return window.localStorage.getItem(RESTART_ACK_KEY) || '';
+      } catch {
+        return '';
+      }
+    }
+
+    function saveRestartAck(version) {
+      try { window.localStorage.setItem(RESTART_ACK_KEY, version); } catch { /* ignore */ }
+    }
+
     function defaultPos() {
       return clampPos({ x: window.innerWidth - BTN - 18, y: window.innerHeight - BTN - 96 });
     }
@@ -580,6 +595,8 @@ window.__ModuleLoader__.load({
       const [pluginMsg, setPluginMsg] = React.useState(null);
       /** 更新会短暂卸掉面板，点一次不够，再点一次才真更新 */
       const [confirmUpdate, setConfirmUpdate] = React.useState(false);
+      /** 关掉「已装好，重启生效」提示时记版本，同一版本不再重复弹 */
+      const [restartAck, setRestartAck] = React.useState(loadRestartAck);
       /** 日志「清空」：只清本地视图，不动 host 的环形缓冲 */
       const [clearedSeq, setClearedSeq] = React.useState(0);
       const [copied, setCopied] = React.useState(false);
@@ -1119,6 +1136,10 @@ window.__ModuleLoader__.load({
       const hotUpdate = Boolean(plugin.hot);
       const hasUpdate = Boolean(updateInfo.hasUpdate);
       const projectHasUpdate = Boolean(updateInfo.projectHasUpdate);
+      /** 盘上装好的版本可能比正在跑的版本新：装完没重启就是这样 */
+      const installedVer = plugin.installedVersion || pluginVer;
+      const pendingRestart = Boolean(plugin.pendingRestart);
+      const showPendingRestart = pendingRestart && restartAck !== installedVer;
 
       const pluginUpdating = pu.status === 'removing' || pu.status === 'installing';
       const pluginUpdateDone = pu.status === 'done';
@@ -1214,9 +1235,11 @@ window.__ModuleLoader__.load({
         key: 'fab',
         type: 'button',
         style: fabStyle,
-        title: hasUpdate
-          ? `Remotion Studio 启动器（启动器有新版本 ${updateInfo.latest}）`
-          : (open ? '收起 Remotion Studio 启动器' : 'Remotion Studio 启动器（可拖动）'),
+        title: showPendingRestart
+          ? `启动器已装好 ${installedVer}，重启 DSH 后生效`
+          : hasUpdate
+            ? `Remotion Studio 启动器（启动器有新版本 ${updateInfo.latest}）`
+            : (open ? '收起 Remotion Studio 启动器' : 'Remotion Studio 启动器（可拖动）'),
         'aria-label': open ? '收起 Remotion Studio 启动器' : '打开 Remotion Studio 启动器',
         'aria-expanded': open,
         onPointerDown,
@@ -1228,8 +1251,8 @@ window.__ModuleLoader__.load({
         onKeyDown,
       }, [
         h('span', { key: 'i' }, open ? '\u00D7' : '\u{1F3AC}'),
-        hasUpdate || pluginUpdating
-          ? h('span', { key: 'd', style: { ...S.badge, background: pluginUpdating ? C.accent : C.warn } })
+        hasUpdate || pluginUpdating || showPendingRestart
+          ? h('span', { key: 'd', style: { ...S.badge, background: pluginUpdating ? C.accent : (hasUpdate ? C.warn : C.ok) } })
           : null,
       ]);
 
@@ -1255,25 +1278,6 @@ window.__ModuleLoader__.load({
             ]),
           ]);
         }
-        if (pluginUpdateDone) {
-          return h('div', {
-            key: 'bn',
-            style: {
-              ...S.banner,
-              borderColor: 'rgba(74,222,128,0.38)',
-              background: 'rgba(74,222,128,0.10)',
-            },
-          }, [
-            dot(C.ok, 6),
-            h('div', { key: 't', style: S.bannerText }, [
-              h('span', { key: 'a', style: { ...S.bannerTitle, color: '#c9f7d8' } },
-                `已更新到 ${pu.to || pluginVer}`),
-              h('span', { key: 'b', style: S.bannerDetail },
-                pu.restartRequired ? '重启 DSH 后生效' : '热更新完成，没有重启 DSH'),
-            ]),
-            h(ActButton, { key: 'x', variant: 'mini', onClick: ackPluginUpdate }, '知道了'),
-          ]);
-        }
         if (pluginUpdateBad) {
           return h('div', {
             key: 'bn',
@@ -1289,6 +1293,52 @@ window.__ModuleLoader__.load({
                 pu.status === 'interrupted' ? '上次更新没有走完' : '更新启动器失败'),
               h('span', { key: 'b', style: { ...S.bannerDetail, wordBreak: 'break-word' } },
                 `${pu.error || '未知原因'}${pu.rollback ? `（${pu.rollback}）` : ''}`),
+            ]),
+            h(ActButton, { key: 'x', variant: 'mini', onClick: ackPluginUpdate }, '知道了'),
+          ]);
+        }
+        /**
+         * 装好了但没重启 —— 这不是「更新完成」，是「还得重启」。
+         * DSH 只能热换客户端模块，主进程那份（index.js）要重启才会重新 import。
+         */
+        if (showPendingRestart) {
+          return h('div', {
+            key: 'bn',
+            style: {
+              ...S.banner,
+              borderColor: 'rgba(74,222,128,0.34)',
+              background: 'rgba(74,222,128,0.09)',
+            },
+          }, [
+            dot(C.ok, 6),
+            h('div', { key: 't', style: S.bannerText }, [
+              h('span', { key: 'a', style: { ...S.bannerTitle, color: '#c9f7d8' } },
+                `已装好 ${installedVer}`),
+              h('span', { key: 'b', style: S.bannerDetail },
+                `重启 DSH 后生效　当前运行 ${pluginVer}`),
+            ]),
+            h(ActButton, {
+              key: 'x',
+              variant: 'mini',
+              onClick: () => { setRestartAck(installedVer); saveRestartAck(installedVer); },
+            }, '知道了'),
+          ]);
+        }
+        if (pluginUpdateDone) {
+          return h('div', {
+            key: 'bn',
+            style: {
+              ...S.banner,
+              borderColor: 'rgba(74,222,128,0.38)',
+              background: 'rgba(74,222,128,0.10)',
+            },
+          }, [
+            dot(C.ok, 6),
+            h('div', { key: 't', style: S.bannerText }, [
+              h('span', { key: 'a', style: { ...S.bannerTitle, color: '#c9f7d8' } },
+                `已更新到 ${pu.to || pluginVer}`),
+              h('span', { key: 'b', style: S.bannerDetail },
+                pu.restartRequired ? '重启 DSH 后生效' : '已经在运行新版本'),
             ]),
             h(ActButton, { key: 'x', variant: 'mini', onClick: ackPluginUpdate }, '知道了'),
           ]);
@@ -1311,8 +1361,8 @@ window.__ModuleLoader__.load({
             h('span', { key: 'b', style: S.bannerDetail },
               canAutoUpdate
                 ? (confirmUpdate
-                  ? '再点一次就开始更新（面板会消失一两秒）'
-                  : `当前 ${pluginVer}　${hotUpdate ? '可一键热更新，无需重启' : '更新后需重启 DSH'}`)
+                  ? '再点一次就开始下载安装'
+                  : `当前 ${pluginVer}　装完要重启 DSH 生效`)
                 : `当前 ${pluginVer}（${KIND_LABEL[pluginKind] || pluginKind}），需要手动重装`),
           ]),
           h(ActButton, {
@@ -1338,7 +1388,9 @@ window.__ModuleLoader__.load({
             key: 'v',
             style: { ...S.value, ...S.ellipsis, fontSize: 11.4 },
             title: plugin.spec || '',
-          }, `${pluginVer}${updateInfo.latest && updateInfo.latest !== pluginVer ? ` → ${updateInfo.latest}` : (updateInfo.latest ? '（已最新）' : '')}`),
+          }, pendingRestart
+            ? `${pluginVer} → ${installedVer}（已装好，重启生效）`
+            : `${pluginVer}${updateInfo.latest && updateInfo.latest !== pluginVer ? ` → ${updateInfo.latest}` : (updateInfo.latest ? '（已最新）' : '')}`),
           h('span', {
             key: 'k',
             style: { fontSize: 10.4, color: C.faint, flex: '0 0 auto' },
@@ -1356,9 +1408,12 @@ window.__ModuleLoader__.load({
             }, confirmUpdate ? '再点一次确认更新' : (pluginUpdating ? '更新中…' : '一键更新启动器')),
             h('div', { key: 'h', style: S.hint },
               hotUpdate
-                ? '会先卸载再用新版装回来，全程不重启 DSH；面板可能消失一两秒，装完自动回来。'
-                : '当前 DSH 没开 HMR：会装上最新版，但需要重启 DSH 才生效。'),
+                ? '会先卸载再用新版装回来。DSH 只能热换界面代码，主进程那份要重启才重新加载，所以装完请重启一次。'
+                : '当前 DSH 没开 HMR：会装上最新版，装完需要重启 DSH 才生效。'),
           ]));
+        } else if (pendingRestart) {
+          rows.push(h('div', { key: 'pr', style: { ...S.hint, color: C.ok } },
+            `新版 ${installedVer} 已经装好，重启 DSH 后生效（当前运行 ${pluginVer}）。`));
         } else if (hasUpdate && pluginKind !== 'npm') {
           rows.push(h('div', { key: 'man', style: { display: 'flex', flexDirection: 'column', gap: 4 } }, [
             h('div', { key: 't', style: { ...S.hint, color: C.warn } },
@@ -1695,7 +1750,19 @@ window.__ModuleLoader__.load({
           h('div', { style: S.titleWrap, key: 'tw' }, [
             dot(healthy ? C.ok : running ? C.warn : C.faint),
             h('span', { style: S.title, key: 't' }, 'Remotion Studio'),
-            h('span', { style: S.verChip, key: 'v' }, `v${pluginVer}`),
+            /* 装好新版没重启时，标题上直接写清「跑的是哪个、盘上是哪个」 */
+            h('span', {
+              key: 'v',
+              style: pendingRestart
+                ? {
+                  ...S.verChip, color: C.ok,
+                  background: 'rgba(74,222,128,0.10)', borderColor: 'rgba(74,222,128,0.36)',
+                }
+                : S.verChip,
+              title: pendingRestart
+                ? `已装好 ${installedVer}，重启 DSH 后生效（当前运行 ${pluginVer}）`
+                : `当前运行 v${pluginVer}`,
+            }, pendingRestart ? `v${pluginVer} → ${installedVer}` : `v${pluginVer}`),
           ]),
           h('div', { key: 'ha', style: S.headActions }, [
             h(IconButton, {

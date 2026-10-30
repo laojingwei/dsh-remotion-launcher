@@ -735,6 +735,19 @@ function loadPluginUpdate() {
     const raw = JSON.parse(fs.readFileSync(UPDATE_MARKER_FILE, 'utf8'))
     if (!raw || typeof raw !== 'object') return
     const at = Number(raw.at) || stat.mtimeMs
+    const target = typeof raw.to === 'string' ? raw.to : null
+    /**
+     * 标记里的目标版本就是这次进程正在跑的版本 —— 更新真的生效了。
+     * 不管是「上次没走完」还是「待重启」，都不该再挂出来，直接清档。
+     */
+    if (target && target === PLUGIN_VERSION && raw.status !== 'failed') {
+      pluginUpdate = {
+        status: 'done', from: raw.from ?? null, to: target, hot: raw.hot === true,
+        restartRequired: false, error: null, at, rollback: null,
+      }
+      try { fs.rmSync(UPDATE_MARKER_FILE, { force: true }) } catch { /* ignore */ }
+      return
+    }
     if (raw.status === 'removing' || raw.status === 'installing') {
       /**
        * 刚写下没多久就当「还在跑」。
@@ -825,8 +838,22 @@ async function runPluginUpdate() {
   const from = PLUGIN_VERSION
   if (!update.pluginLatest) await checkUpdates().catch(() => {})
   const to = update.pluginLatest
-  if (!hasNewer(to, from)) {
-    pluginUpdate = { ...pluginUpdate, status: 'failed', error: '已经是最新版本', from, to: to ?? null, at: Date.now() }
+  /**
+   * 已经装过目标版本就别再装一遍。
+   *
+   * 插件主进程半部（index.js）一旦被 import 就锁在内存里，装完新文件、
+   * 运行中的仍是旧代码，面板会一直显示「当前 1.0.6，可更新到 1.0.7」。
+   * 判断要用「落盘版本」，否则点一次、装一次，永远停不下来。
+   */
+  const installedVersion = typeof pluginInstall.version === 'string' ? pluginInstall.version : from
+  if (!hasNewer(to, installedVersion)) {
+    const waiting = installedVersion !== from
+    pluginUpdate = {
+      ...pluginUpdate, status: 'failed', from, to: to ?? installedVersion, at: Date.now(),
+      error: waiting
+        ? `已经装好 ${installedVersion}，重启 DSH 后生效（当前运行 ${from}）`
+        : '已经是最新版本',
+    }
     savePluginUpdate()
     return
   }
@@ -842,10 +869,10 @@ async function runPluginUpdate() {
   const hot = refreshHmr()
   pluginUpdate = {
     status: hot ? 'removing' : 'installing', from, to, hot,
-    restartRequired: !hot, error: null, at: Date.now(), rollback: null,
+    restartRequired: true, error: null, at: Date.now(), rollback: null,
   }
   savePluginUpdate()
-  sys(`▸ 更新启动器 ${from} → ${to}（${hot ? '热更新：先卸载再装回，不重启 DSH' : '当前 DSH 未开 HMR，装完需重启'}）`)
+  sys(`▸ 更新启动器 ${from} → ${to}（${hot ? '先卸载再装回' : '当前 DSH 未开 HMR'}，装完要重启 DSH 才生效）`)
 
   let removed = false
   try {
@@ -868,33 +895,48 @@ async function runPluginUpdate() {
       throw new Error(applied === 'cancelled' ? '安装被取消，插件文件已还原' : pmErrorText(code, '安装'))
     }
     // ChangeResult 不带版本号，装完回读一次，面板上显示的就是真实落盘版本
-    const installed = typeof pm.listBundles === 'function'
+    const installedRow = typeof pm.listBundles === 'function'
       ? (await pm.listBundles()).find((item) => item && item.name === PLUGIN_NAME)
       : null
+    const landed = (installedRow && typeof installedRow.version === 'string' && installedRow.version) || to
+    /**
+     * 「装上了」不等于「跑起来了」。
+     *
+     * PLUGIN_VERSION 是本进程启动时读到的，装完不会变；DSH 的 HMR 能换客户端模块，
+     * 换不掉已经被 import 的主进程半部（reload 的 restartReason 就是 host-module）。
+     * 所以判定标准是「落盘版本 vs 运行版本」，不看 ChangeResult 的 applied ——
+     * 它只说明档案写成了，不代表这份代码在跑。
+     */
+    const needsRestart = landed !== PLUGIN_VERSION
     pluginUpdate = {
       ...pluginUpdate,
       status: 'done',
-      to: (installed && typeof installed.version === 'string' && installed.version) || to,
-      restartRequired: applied === 'restart-required',
+      to: landed,
+      restartRequired: needsRestart || applied === 'restart-required',
       error: null,
+      rollback: null,
       at: Date.now(),
     }
+    // 让面板上的「已安装版本」立刻跟上，不必等下一次 listBundles
+    pluginInstall = { ...pluginInstall, version: landed }
     savePluginUpdate()
-    sys(result.application === 'restart-required'
-      ? `启动器已更新到 ${pluginUpdate.to}，重启 DSH 后生效`
-      : `启动器已更新到 ${pluginUpdate.to}（热更新完成，没有重启 DSH）`)
+    sys(pluginUpdate.restartRequired
+      ? `启动器已装到 ${landed}，重启 DSH 后生效（当前运行 ${PLUGIN_VERSION}）`
+      : `启动器已更新到 ${landed}，已生效`)
   } catch (error) {
     const message = error && error.message ? error.message : String(error)
     sys(`更新启动器失败：${message}`)
     let rollback = null
     // 已经卸掉了才需要救：把原版本装回去，用户至少还有一个能用的面板
     if (removed) {
-      sys(`▸ 尝试回滚到 ${from}`)
+      // 回滚到「开装之前盘上的版本」：可能本来就装着一版新版在等重启，别把它降回去
+      const rollbackTo = installedVersion !== to ? installedVersion : from
+      sys(`▸ 尝试回滚到 ${rollbackTo}`)
       try {
-        const back = await pm.installBundle(`${PLUGIN_NAME}@${from}`, {})
+        const back = await pm.installBundle(`${PLUGIN_NAME}@${rollbackTo}`, {})
         const backOk = back && back.application !== 'failed' && back.application !== 'cancelled'
         rollback = backOk
-          ? `已回滚到 ${from}`
+          ? `已回滚到 ${rollbackTo}`
           : pmErrorText(back && back.error && back.error.code, '回滚')
       } catch (backError) {
         rollback = `回滚失败：${backError && backError.message ? backError.message : String(backError)}`
@@ -1049,6 +1091,13 @@ function snapshot(sinceSeq) {
   syncPluginUpdateFromDisk()
   const since = Number(sinceSeq ?? 0) || 0
   const fresh = logs.filter((entry) => entry.seq > since)
+  /**
+   * 「运行版本」和「落盘版本」是两件事：装完新包、没重启时，运行的仍是旧的。
+   * 面板必须按落盘版本判断「还能不能更新」，否则会一直催着装已经装好的版本。
+   */
+  const runningVersion = PLUGIN_VERSION
+  const installedVersion = typeof pluginInstall.version === 'string' ? pluginInstall.version : runningVersion
+  const pendingRestart = installedVersion !== runningVersion && isNewerVersion(installedVersion, runningVersion)
   return {
     projectRoot,
     projectValid: projectValid(),
@@ -1063,7 +1112,10 @@ function snapshot(sinceSeq) {
     /** 插件自身的安装情况 + 能不能一键更新 + 走不走热更新 */
     plugin: {
       name: PLUGIN_NAME,
-      version: PLUGIN_VERSION,
+      version: runningVersion,
+      /** 已装到盘上的版本：和 version 不同就说明要重启才生效 */
+      installedVersion,
+      pendingRestart,
       kind: pluginInstall.kind,
       spec: pluginInstall.spec,
       removable: pluginInstall.removable,
@@ -1078,7 +1130,8 @@ function snapshot(sinceSeq) {
       registry: update.registry,
       latest: update.pluginLatest,
       projectLatest: update.projectLatest,
-      hasUpdate: hasNewer(update.pluginLatest, PLUGIN_VERSION),
+      // 对比「落盘版本」：已经装好新版只等重启时，不该再提示「可以更新」
+      hasUpdate: hasNewer(update.pluginLatest, installedVersion),
       projectHasUpdate: hasNewer(update.projectLatest, readProjectVersion()),
       error: update.error,
     },
@@ -1229,11 +1282,20 @@ async function handle(req, res) {
       if (!pluginInstall.removable) {
         return reply(409, { ok: false, error: 'DSH 不允许直接卸载这个插件（可能随安装包自带），请到「设置 → 插件」处理' })
       }
-      if (!update.pluginLatest) await checkUpdates().catch(() => {})
-      if (!hasNewer(update.pluginLatest, PLUGIN_VERSION)) {
-        return reply(409, { ok: false, error: '已经是最新版本' })
+      // 用户主动点更新：现查一次，别拿启动时那份缓存（可能已经过时）做判断
+      await checkUpdates().catch(() => {})
+      const installedVersion = typeof pluginInstall.version === 'string' ? pluginInstall.version : PLUGIN_VERSION
+      if (!hasNewer(update.pluginLatest, installedVersion)) {
+        // 已经装到最好了：运行中那份永远是旧的，继续点也装不出新东西
+        const waiting = installedVersion !== PLUGIN_VERSION
+        return reply(409, {
+          ok: false,
+          error: waiting
+            ? `已经装好 ${installedVersion}，重启 DSH 后生效（当前运行 ${PLUGIN_VERSION}）`
+            : '已经是最新版本',
+        })
       }
-      // 先把响应发回去再动插件：热更新第一步就会把这个面板自己卸掉
+      // 先把响应发回去再动插件：卸载那一步会把面板自己拆掉
       setTimeout(() => { void runPluginUpdate() }, 80)
       return reply(202, { ok: true, ...snapshot(0) })
     }

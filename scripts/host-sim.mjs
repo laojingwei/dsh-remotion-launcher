@@ -230,14 +230,20 @@ check('GET /state 带启动器版本/安装方式/更新状态', () => {
     if (!(key in body)) throw new Error(`快照缺字段 ${key}`)
   }
   const plugin = body.plugin
-  for (const key of ['name', 'version', 'kind', 'canAutoUpdate', 'hot', 'manualSpec']) {
+  for (const key of ['name', 'version', 'kind', 'canAutoUpdate', 'hot', 'manualSpec', 'installedVersion', 'pendingRestart']) {
     if (!(key in plugin)) throw new Error(`plugin 缺字段 ${key}`)
   }
   for (const key of ['checkedAt', 'latest', 'hasUpdate', 'error']) {
     if (!(key in body.update)) throw new Error(`update 缺字段 ${key}`)
   }
   if (body.pluginUpdate.status !== 'idle') throw new Error(`初始更新状态应为 idle，实际 ${body.pluginUpdate.status}`)
-  console.log(`      启动器 ${plugin.version}（${plugin.kind}）  热更新可用：${plugin.hot}`)
+  /**
+   * 落盘版本和运行版本要分开报。假插件管理器给的是同一个版本，
+   * 所以这里断言两者一致、且不误报「装了等重启」。
+   */
+  if (typeof plugin.installedVersion !== 'string') throw new Error('installedVersion 应是字符串')
+  if (plugin.pendingRestart) throw new Error('版本一致时不该报待重启')
+  console.log(`      启动器 ${plugin.version}（${plugin.kind}）  已安装 ${plugin.installedVersion}  热更新可用：${plugin.hot}`)
   console.log(`      静默检查：${body.update.checkedAt ? new Date(body.update.checkedAt).toLocaleTimeString() : '未检查'}  新版：${body.update.latest ?? '—'}`)
 })
 

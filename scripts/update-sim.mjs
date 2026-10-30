@@ -20,7 +20,8 @@ process.env.DSH_HOME = scratch
 fs.rmSync(scratch, { recursive: true, force: true })
 
 /* ── 本地假 registry：只认 /<pkg>/latest ── */
-const LATEST = '9.9.9'
+/** 打包版本可以按用例改，用来模拟「装完一版又有新一版」 */
+let latestVersion = '9.9.9'
 const registry = http.createServer((req, res) => {
   const match = /^\/(.+)\/latest$/.exec(req.url ?? '')
   if (!match) {
@@ -28,7 +29,7 @@ const registry = http.createServer((req, res) => {
     return
   }
   res.writeHead(200, { 'content-type': 'application/json' })
-  res.end(JSON.stringify({ name: decodeURIComponent(match[1]), version: LATEST }))
+  res.end(JSON.stringify({ name: decodeURIComponent(match[1]), version: latestVersion }))
 })
 await new Promise((resolve) => registry.listen(0, '127.0.0.1', resolve))
 const registryUrl = `http://127.0.0.1:${registry.address().port}`
@@ -139,18 +140,43 @@ await new Promise((resolve) => setTimeout(resolve, 500))
 const afterUpdate = await state()
 check('热更新顺序：先 remove 再 install 到新版本', () => {
   const removeAt = calls.indexOf('remove:dsh-remotion-launcher')
-  const installAt = calls.findIndex((c) => c === 'install:dsh-remotion-launcher@9.9.9')
+  const installAt = calls.findIndex((c) => c === `install:dsh-remotion-launcher@${latestVersion}`)
   if (removeAt === -1) throw new Error(`没有调用 removeBundle：${JSON.stringify(calls)}`)
-  if (installAt === -1) throw new Error(`没有装 9.9.9：${JSON.stringify(calls)}`)
+  if (installAt === -1) throw new Error(`没有装 ${latestVersion}：${JSON.stringify(calls)}`)
   if (removeAt > installAt) throw new Error('顺序错了，应该先卸载再装')
 })
 
-check('更新结果落到 done，且不需要重启', () => {
+check('装完要求重启，不谎称热更新已生效', () => {
   const pu = afterUpdate.pluginUpdate
   if (pu.status !== 'done') throw new Error(`状态应为 done，实际 ${pu.status}（${pu.error ?? ''}）`)
-  if (pu.to !== LATEST) throw new Error(`to 应为 ${LATEST}，实际 ${pu.to}`)
-  if (pu.restartRequired) throw new Error('热更新不该要求重启')
-  console.log(`      ${pu.from} → ${pu.to}　${pu.restartRequired ? '需重启' : '热更新'}`)
+  if (pu.to !== latestVersion) throw new Error(`to 应为 ${latestVersion}，实际 ${pu.to}`)
+  /*
+   * 关键回归：插件主进程半部装完不会重新 import，运行版本还是旧的。
+   * 所以「装好了」必须等于「要重启」，不能因为 ChangeResult 说 applied 就当已生效。
+   */
+  if (!pu.restartRequired) throw new Error('装完应标记需要重启 DSH')
+  if (!afterUpdate.plugin.pendingRestart) throw new Error('快照应标记 pendingRestart')
+  if (afterUpdate.plugin.installedVersion !== latestVersion) {
+    throw new Error(`已安装版本应为 ${latestVersion}，实际 ${afterUpdate.plugin.installedVersion}`)
+  }
+  console.log(`      ${pu.from} → ${pu.to}　需重启（运行中仍是 ${afterUpdate.plugin.version}）`)
+})
+
+check('已装好新版后不再提示「可以更新」', () => {
+  if (afterUpdate.update.hasUpdate) throw new Error('已装到最新却还在提示更新（会没完没了地催）')
+})
+
+const repeat = await (async () => {
+  calls.length = 0
+  const res = await request('POST', '/remotion-plugin/plugin-update')
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  return { res, body: await state() }
+})()
+check('重复点更新：不装第二遍，直接说「重启生效」', () => {
+  if (calls.length !== 0) throw new Error(`不该再动插件：${JSON.stringify(calls)}`)
+  const pu = repeat.body.pluginUpdate
+  if (pu.status !== 'done') throw new Error(`状态应为 done（等重启），实际 ${pu.status}`)
+  console.log(`      ${pu.error ?? '等重启'}`)
 })
 
 check('更新标记落盘（DSH 中途退出也能看到结果）', () => {
@@ -179,21 +205,26 @@ check('GitHub 安装点更新被拒绝，且说清要手动卸载', () => {
 
 /* ── 3. 装不上要自己回滚 ── */
 fakePm.source = 'dsh-remotion-launcher@^1.0.6'
-fakePm.failInstallOf = LATEST
+// 盘上已经是 9.9.9（上一节装的），这里再发一版更"新"的，让它装失败
+const installedBefore = (await state()).plugin.installedVersion
+latestVersion = '9.9.10'
+fakePm.failInstallOf = latestVersion
 calls.length = 0
 await request('POST', '/remotion-plugin/plugin-update')
 await new Promise((resolve) => setTimeout(resolve, 500))
 const rolled = await state()
-check('装新版失败后回滚到原版本', () => {
+check('装新版失败后回滚到开装前的版本', () => {
   const pu = rolled.pluginUpdate
   if (pu.status !== 'rolled-back') throw new Error(`状态应为 rolled-back，实际 ${pu.status}（${pu.error ?? ''}）`)
   if (!/已回滚/.test(pu.rollback ?? '')) throw new Error(`回滚说明不对：${pu.rollback}`)
-  // 回滚目标就是这次更新的起点版本，不写死数字：package.json 改版本不该让测试红
-  const expected = `install:dsh-remotion-launcher@${pu.from}`
+  // 回滚目标是「这次动手前盘上的版本」，不是运行版本：别把已装好的新版降回去
+  const expected = `install:dsh-remotion-launcher@${installedBefore}`
   if (!calls.some((c) => c === expected)) {
-    throw new Error(`没有尝试装回原版本 ${pu.from}：${JSON.stringify(calls)}`)
+    throw new Error(`没有装回 ${installedBefore}：${JSON.stringify(calls)}`)
   }
-  if (/@undefined$/.test(expected)) throw new Error('回滚目标版本是空的')
+  if (!rolled.plugin.installedVersion || rolled.plugin.installedVersion === 'undefined') {
+    throw new Error('回滚后已安装版本丢了')
+  }
   console.log(`      ${pu.error}　${pu.rollback}`)
 })
 
@@ -201,17 +232,17 @@ check('装新版失败后回滚到原版本', () => {
 await request('POST', '/remotion-plugin/plugin-update/ack')
 fakePm.failInstallOf = null
 hmrPresent = false
+latestVersion = '9.9.11'
 calls.length = 0
 await request('POST', '/remotion-plugin/plugin-update')
 await new Promise((resolve) => setTimeout(resolve, 500))
 const noHmr = await state()
-check('无 HMR 时不卸载，只装新版并标记需重启', () => {
+check('无 HMR 时不卸载，装完仍要求重启', () => {
   if (calls.some((c) => c.startsWith('remove:'))) throw new Error(`不该卸载：${JSON.stringify(calls)}`)
   const pu = noHmr.pluginUpdate
   if (pu.status !== 'done') throw new Error(`状态应为 done，实际 ${pu.status}`)
-  if (pu.restartRequired) {
-    console.log('      装完提示重启（fake install 返回 applied，真实 DSH 视情况返回 restart-required）')
-  }
+  if (!pu.restartRequired) throw new Error('装完应要求重启')
+  console.log(`      装到 ${pu.to}，等重启（运行中 ${noHmr.plugin.version}）`)
 })
 
 registry.close()
