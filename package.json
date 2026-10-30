@@ -21,7 +21,9 @@
   "scripts": {
     "smoke": "node scripts/smoke.mjs",
     "host-sim": "node scripts/host-sim.mjs",
-    "check:encoding": "node scripts/check-encoding.mjs"
+    "update-sim": "node scripts/update-sim.mjs",
+    "check:encoding": "node scripts/check-encoding.mjs",
+    "test": "node scripts/check-encoding.mjs && node scripts/smoke.mjs && node scripts/host-sim.mjs && node scripts/update-sim.mjs"
   },
   "dsh": {
     "bundle": {

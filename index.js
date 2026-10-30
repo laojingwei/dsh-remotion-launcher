@@ -78,28 +78,118 @@ function baseUrl() { return `http://localhost:${port}` }
 function probeUrl() { return `http://127.0.0.1:${port}` }
 function projectValid() { return looksLikeProject(projectRoot) }
 
+/* ── MCP 配置 ───────────────────────────────────────────────────── */
+/** 连接器里认的服务器名，也是工具前缀（mcp__remotion-studio__*） */
+const MCP_SERVER_NAME = 'remotion-studio'
+
+/** JSON 里统一用正斜杠：Windows 路径不用再写一堆 \\ */
+function toPosix(target) {
+  return String(target).replace(/\\/g, '/')
+}
+
+function isFile(target) {
+  try { return fs.statSync(target).isFile() } catch { return false }
+}
+
+/**
+ * 给连接器管理页粘贴的那段 JSON。
+ *
+ * 两种接法各有用：
+ *  · stdio —— 常驻子进程，第一次调用会自己把本地服务拉起来；改代码要重连才生效
+ *  · http  —— 连已经在跑的服务（端点要带 /mcp），不起新进程，服务停了就断
+ *
+ * 路径都用绝对路径 + 工程内的 tsx，不依赖宿主进程的 cwd
+ * （MCP 客户端的启动目录经常不是工程目录）。
+ */
+function buildMcpConfig() {
+  const root = toPosix(projectRoot).replace(/\/+$/, '')
+  const tsxCli = `${root}/node_modules/tsx/dist/cli.mjs`
+  const proxy = `${root}/server/mcp-proxy.ts`
+  const serverUrl = `http://127.0.0.1:${port}`
+  const httpUrl = `${serverUrl}/mcp`
+  const valid = projectValid()
+  return {
+    name: MCP_SERVER_NAME,
+    serverUrl,
+    httpUrl,
+    /** stdio 要本地依赖装齐：tsx 和代理入口都得在 */
+    stdioReady: valid && isFile(tsxCli) && isFile(proxy),
+    /** HTTP 要服务在跑：自己启动的，或外部已经跑着的 */
+    httpReady: serverProc !== null || lastHealthy,
+    stdio: {
+      mcpServers: {
+        [MCP_SERVER_NAME]: {
+          command: 'node',
+          args: [tsxCli, proxy],
+          env: { SERVER_URL: serverUrl },
+        },
+      },
+    },
+    http: {
+      mcpServers: {
+        [MCP_SERVER_NAME]: { type: 'http', url: httpUrl },
+      },
+    },
+  }
+}
+
 /** 从 npm 装的是哪个包；工程仓库单独发布，不随插件走 */
 const PROJECT_PACKAGE = process.env.REMOTION_PROJECT_PACKAGE ?? 'remotion-studio-mcp'
 /** 下载源：官方 / 国内镜像 / 自定义 */
 const DEFAULT_REGISTRY = 'https://registry.npmmirror.com'
+/**
+ * 当前下载源：环境变量 → 面板里存过的 → npmmirror。
+ * 启动时的静默更新检查也走它，所以必须跟面板共享同一份值（存 settings 里）。
+ */
+let registry = process.env.DSH_REGISTRY ?? DEFAULT_REGISTRY
 
-/** 插件自身版本：读自己的 package.json，别写死 */
-const PLUGIN_PACKAGE = 'dsh-remotion-launcher'
-const PLUGIN_VERSION = (() => {
+/** 插件自身：包名 / 版本 / 仓库地址都从自己的 package.json 读，别写死 */
+const PLUGIN_META = (() => {
   try {
-    const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'))
-    return typeof pkg.version === 'string' ? pkg.version : '0.0.0'
+    return JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'))
   } catch {
-    return '0.0.0'
+    return {}
   }
 })()
+const PLUGIN_NAME = typeof PLUGIN_META.name === 'string' && PLUGIN_META.name ? PLUGIN_META.name : 'dsh-remotion-launcher'
+const PLUGIN_VERSION = typeof PLUGIN_META.version === 'string' ? PLUGIN_META.version : '0.0.0'
+
+/** 仓库地址 → `github:owner/repo`，给「手动重装」的提示用 */
+const PLUGIN_REPO_SPEC = (() => {
+  const raw = PLUGIN_META.repository
+  const url = typeof raw === 'string' ? raw : String((raw && raw.url) || '')
+  const found = /github\.com[/:]([^/]+)\/([^/#?]+)/i.exec(url)
+  return found ? `github:${found[1]}/${found[2].replace(/\.git$/i, '')}` : null
+})()
+
+/** 拿不到 pluginManager 时的兜底判断：在 node_modules 里当 npm 装的，否则是源码目录 */
+const PLUGIN_SOURCE_FALLBACK = PLUGIN_DIR.includes(`${path.sep}node_modules${path.sep}`) ? 'npm' : 'link'
+
 /**
- * 插件是怎么装的：
- *  · 'npm'  —— 在 node_modules 里，版本跟随 registry，可以「检查更新」
- *  · 'link' —— 直接指向源码目录，版本取决于那份源码；npm 发了新版也不会变，
- *              必须卸载后重装 npm 版才生效
+ * 插件是怎么装上的。以 DSH 自己的记录为准（`pluginManager.listBundles()` 的 `source`）：
+ *
+ *   npm       `dsh-remotion-launcher@^1.0.6`  → 跟 registry 走，能一键热更新
+ *   git       `github:you/repo`、git URL      → 必须卸载后重装
+ *   link      `link:/path`                    → 源码目录，改源码或卸载重装
+ *   local     `file:/path`、本地 tgz          → 同上
+ *   tarball   远程 tgz                        → 同上
+ *
+ * 只有 npm 装的那条路可以「点按钮更新」，其余一律提示手动卸载再装。
  */
-const PLUGIN_SOURCE = PLUGIN_DIR.includes(`${path.sep}node_modules${path.sep}`) ? 'npm' : 'link'
+let pluginInstall = {
+  kind: PLUGIN_SOURCE_FALLBACK,
+  spec: null,
+  version: PLUGIN_VERSION,
+  removable: false,
+  managed: false,
+}
+
+/** DSH 的插件管理服务；宿主没装（headless 之类）就是 null */
+let pluginManager = null
+/** 宿主侧是否有 HMR：有才能真正热更新，没有只能「装完重启」 */
+let hmrLive = false
+/** apply() 存下来的 ctx，用来按需取服务 */
+let hostCtx = null
 
 /** 当前工程目录里 package.json 的版本 */
 function readProjectVersion() {
@@ -145,7 +235,7 @@ let panelPos = null
 function persist() {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true })
-    const data = { fabPos, panelPos, port, projectRoot: projectRootOverride }
+    const data = { fabPos, panelPos, port, registry, projectRoot: projectRootOverride }
     fs.writeFileSync(SETTINGS_FILE, `${JSON.stringify(data, null, 2)}\n`, 'utf8')
     return true
   } catch (error) {
@@ -167,6 +257,10 @@ function loadPersisted() {
     }
     if (!PORT_FROM_ENV && raw && Number.isInteger(raw.port) && raw.port >= 1024 && raw.port <= 65535) {
       port = raw.port
+    }
+    // 下载源：面板换过就跟着走，启动时的静默更新检查也用它
+    if (typeof raw?.registry === 'string' && /^https?:\/\//i.test(raw.registry.trim())) {
+      registry = raw.registry.trim()
     }
     // 用户在面板里选的工程目录，优先于自动探测。
     // 两个坑都在这拦着：
@@ -471,6 +565,353 @@ async function updateProject({ registry }) {
   }
 }
 
+/* ── 更新检查（启动静默一次 + 面板手动刷） ─────────────────────── */
+
+/**
+ * 语义化版本比较：a 比 b 新返回 true。
+ * 只处理 `1.2.3` / `1.2.3-beta.1`，不处理范围（`^`、`~`），因为这里比的是
+ * 具体版本：本地 package.json 里读出来的 vs registry 上的 latest。
+ */
+function isNewerVersion(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false
+  const parse = (value) => {
+    const [core, pre] = String(value).trim().replace(/^v/i, '').split('-')
+    const nums = core.split('.').map((part) => Number.parseInt(part, 10) || 0)
+    return { nums: [nums[0] ?? 0, nums[1] ?? 0, nums[2] ?? 0], pre: pre ?? '' }
+  }
+  const left = parse(a)
+  const right = parse(b)
+  for (let i = 0; i < 3; i += 1) {
+    if (left.nums[i] !== right.nums[i]) return left.nums[i] > right.nums[i]
+  }
+  if (left.pre === right.pre) return false
+  if (left.pre === '') return true          // 正式版比预发布版新
+  if (right.pre === '') return false
+  return left.pre > right.pre
+}
+
+/** 最新版本检查结果：每次 DSH 启动静默查一次，面板里也能手动刷 */
+let update = {
+  checkedAt: null,
+  registry: null,
+  pluginLatest: null,
+  projectLatest: null,
+  error: null,
+}
+
+async function checkUpdates(reg = registry) {
+  const base = /^https?:\/\//i.test(String(reg)) ? String(reg) : DEFAULT_REGISTRY
+  const [pluginLatest, projectLatest] = await Promise.all([
+    fetchLatestVersion(PLUGIN_NAME, base),
+    fetchLatestVersion(PROJECT_PACKAGE, base),
+  ])
+  update = {
+    checkedAt: Date.now(),
+    registry: base,
+    pluginLatest,
+    projectLatest,
+    error: pluginLatest ? null : '查不到最新版本（网络不通、镜像没同步，或包名不对）',
+  }
+  return update
+}
+
+/** a 是 b 之后的版本，且 b 存在 */
+function hasNewer(latest, current) {
+  return typeof latest === 'string' && isNewerVersion(latest, current)
+}
+
+/* ── 插件自身的安装方式 ─────────────────────────────────────────── */
+
+/** 从 pnpm 记录的 spec 判断安装方式 */
+function classifyInstallSource(spec) {
+  const text = String(spec ?? '').trim()
+  if (!text) return 'unknown'
+  if (/\.(?:tgz|tar\.gz)(?:#.*)?$/i.test(text)) return 'tarball'
+  if (/^link:/i.test(text)) return 'link'
+  if (/^file:/i.test(text)) return 'local'
+  if (/^(?:github|gitlab|bitbucket|gist):/i.test(text)) return 'git'
+  if (/^git(?:\+[a-z]+)?:\/\//i.test(text) || /^git@[^:]+:/i.test(text)) return 'git'
+  if (/^https?:\/\//i.test(text)) return 'git'   // 仓库 URL（tgz 已经在上面拦掉了）
+  return 'npm'                                    // `name@range` / `name@tag`
+}
+
+/**
+ * 读一次「这个插件是怎么装的」。
+ *
+ * 走 DSH 的 pluginManager.listBundles()：它给的 `source` 就是 `pnpm add` 会用的
+ * 那个 spec（`dsh-remotion-launcher@^1.0.6` / `github:you/repo` / `link:/dir`），
+ * 比自己猜 node_modules 靠谱 —— GitHub 安装的包同样落在 node_modules 里，
+ * 只看路径会全部误判成 npm。
+ */
+async function refreshPluginInstall() {
+  const pm = pluginManager
+  if (!pm || typeof pm.listBundles !== 'function') {
+    pluginInstall = {
+      kind: PLUGIN_SOURCE_FALLBACK, spec: null, version: PLUGIN_VERSION,
+      removable: false, managed: false,
+    }
+    return pluginInstall
+  }
+  try {
+    const bundles = await pm.listBundles()
+    const row = Array.isArray(bundles) ? bundles.find((item) => item && item.name === PLUGIN_NAME) : null
+    if (!row) {
+      pluginInstall = {
+        kind: PLUGIN_SOURCE_FALLBACK, spec: null, version: PLUGIN_VERSION,
+        removable: false, managed: true,
+      }
+      return pluginInstall
+    }
+    pluginInstall = {
+      managed: true,
+      kind: classifyInstallSource(row.source),
+      spec: typeof row.source === 'string' ? row.source : null,
+      version: typeof row.version === 'string' ? row.version : PLUGIN_VERSION,
+      removable: row.removable === true,
+      enabled: row.enabled === true,
+    }
+  } catch (error) {
+    sys(`读取插件安装方式失败：${error && error.message ? error.message : String(error)}`)
+  }
+  return pluginInstall
+}
+
+/** 宿主侧 HMR 是否存在：决定「装完就生效」还是「装完要重启」 */
+function refreshHmr() {
+  try {
+    hmrLive = Boolean(hostCtx && typeof hostCtx.get === 'function' && hostCtx.get('hmr'))
+  } catch {
+    hmrLive = false
+  }
+  return hmrLive
+}
+
+/** 能不能走面板上的「一键更新」：npm 装的 + 宿主给我卸载权限 */
+function canAutoUpdate() {
+  return Boolean(pluginManager) && pluginInstall.kind === 'npm' && pluginInstall.removable
+}
+
+/** 手动重装时该填什么 spec：优先用用户当初装的那条，其次推回仓库地址 */
+function reinstallSpec() {
+  if (pluginInstall.kind === 'git' && PLUGIN_REPO_SPEC) return PLUGIN_REPO_SPEC
+  if (pluginInstall.kind === 'link' && pluginInstall.spec) return pluginInstall.spec
+  if (pluginInstall.kind === 'local' && pluginInstall.spec) return pluginInstall.spec
+  if (pluginInstall.kind === 'tarball' && pluginInstall.spec) return pluginInstall.spec
+  return PLUGIN_NAME
+}
+
+/* ── 插件热更新 ────────────────────────────────────────────────── */
+
+/**
+ * 更新进度存在磁盘上，而不是只放在内存里。
+ *
+ * 原因：HMR 生效时，第一步 removeBundle 就会把这个插件自己卸掉 ——
+ * 面板、路由、模块全没了，只有这段 async 函数还活在 Node 里。等 installBundle
+ * 把新版装回来，apply() 会在同一个进程里再跑一遍，读这个文件才知道
+ * 「刚才那次更新到底成没成」。DSH 中途退出也一样，下次启动能看到结果。
+ */
+const UPDATE_MARKER_FILE = path.join(STATE_DIR, 'remotion-launcher-update.json')
+
+/** @type {{status:'idle'|'removing'|'installing'|'done'|'failed'|'rolled-back'|'interrupted',
+ *          from:string|null,to:string|null,hot:boolean,restartRequired:boolean,
+ *          error:string|null,at:number|null,rollback:string|null}} */
+let pluginUpdate = {
+  status: 'idle', from: null, to: null, hot: false,
+  restartRequired: false, error: null, at: null, rollback: null,
+}
+
+function savePluginUpdate() {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true })
+    fs.writeFileSync(UPDATE_MARKER_FILE, `${JSON.stringify(pluginUpdate, null, 2)}\n`, 'utf8')
+  } catch (error) {
+    sys(`记录更新进度失败：${error && error.message ? error.message : String(error)}`)
+  }
+}
+
+function loadPluginUpdate() {
+  try {
+    const stat = fs.statSync(UPDATE_MARKER_FILE)
+    const raw = JSON.parse(fs.readFileSync(UPDATE_MARKER_FILE, 'utf8'))
+    if (!raw || typeof raw !== 'object') return
+    const at = Number(raw.at) || stat.mtimeMs
+    if (raw.status === 'removing' || raw.status === 'installing') {
+      /**
+       * 刚写下没多久就当「还在跑」。
+       *
+       * 热更新时 HMR 会先用新版实例把本插件拉起来，此刻旧实例的 async 函数
+       * 还在做 installBundle —— 新版这个 apply() 读到的必然是「installing」。
+       * 按时间判：5 分钟内算进行中，超过就当那次更新确实没走完。
+       */
+      pluginUpdate = Date.now() - at < 5 * 60_000
+        ? { ...pluginUpdate, ...raw, at }
+        : {
+            ...pluginUpdate, ...raw, status: 'interrupted', at,
+            error: raw.error ?? '上次更新没有走完（DSH 中途退出？请确认插件还在）',
+          }
+      return
+    }
+    if (['done', 'failed', 'rolled-back'].includes(raw.status)) {
+      pluginUpdate = { ...pluginUpdate, ...raw, at }
+    }
+  } catch { /* 没有这个文件是常态 */ }
+}
+
+function clearPluginUpdate() {
+  pluginUpdate = {
+    status: 'idle', from: null, to: null, hot: false,
+    restartRequired: false, error: null, at: null, rollback: null,
+  }
+  try { fs.rmSync(UPDATE_MARKER_FILE, { force: true }) } catch { /* ignore */ }
+}
+
+/**
+ * 热更新期间，真正把新版装完的是「旧实例」——它被 HMR 停掉了，但那条
+ * async 流程还活着，装完会往标记文件里写 done。新实例内存里永远停在
+ * installing，所以每次出快照都顺手从磁盘捞一次结果，别让面板一直转圈。
+ */
+function syncPluginUpdateFromDisk() {
+  if (pluginUpdate.status !== 'removing' && pluginUpdate.status !== 'installing') return
+  try {
+    const raw = JSON.parse(fs.readFileSync(UPDATE_MARKER_FILE, 'utf8'))
+    if (!raw || typeof raw !== 'object') return
+    if (['done', 'failed', 'rolled-back'].includes(raw.status)) {
+      pluginUpdate = { ...pluginUpdate, ...raw }
+    }
+  } catch { /* 文件还没写出来 / 被删了，保持当前状态 */ }
+}
+
+/** 正在跑的更新不允许并发触发 */
+function updatingPlugin() {
+  return pluginUpdate.status === 'removing' || pluginUpdate.status === 'installing'
+}
+
+/** 把 DSH 插件管理的错误码翻成人话，别把 already-installed 直接甩给用户 */
+const PM_ERROR_TEXT = {
+  'already-installed': 'DSH 里还装着旧版：先到「设置 → 插件」卸载，再重启让它装新版',
+  'not-removable': '这个插件不允许从面板卸载（可能是随 DSH 安装包自带的）',
+  'bundle-in-use': '插件正在被使用，稍等一下再试',
+  'not-bundle': '这个包不是 DSH 插件，检查包名',
+  'invalid-spec': '版本号 DSH 不认，检查包名/版本',
+  'ambiguous-install': '装出来的包不唯一，检查依赖',
+  'incompatible-version': '新版与当前 DSH 版本不兼容',
+  'stop-profile': 'DSH 正在停止，稍后再试',
+  'operation-error': 'DSH 执行安装时出错，看下方日志',
+}
+
+function pmErrorText(code, action) {
+  const hint = code ? PM_ERROR_TEXT[code] : null
+  return hint ? `${action}失败：${hint}` : `${action}失败${code ? `（${code}）` : '（未知原因）'}`
+}
+
+/**
+ * 热更新：remove → install，两步都由 DSH 的 pluginManager 做，全程不重启。
+ *
+ * 为什么必须先 remove：宿主开着 HMR 时，installBundle 对已安装的包会直接
+ * 拒绝（already-installed），因为「覆盖一个正在跑的包」会把旧实例留在内存里。
+ * 所以顺序得是：卸掉（HMR 会立刻停掉本插件）→ 装新版（HMR 再把新版拉起来）。
+ *
+ * 失败会尽量自己救回来：卸掉后装不上，就把原来的版本装回去，别让用户
+ * 面对一个「插件消失」的界面。
+ */
+async function runPluginUpdate() {
+  const pm = pluginManager
+  if (!pm) {
+    pluginUpdate = { ...pluginUpdate, status: 'failed', error: '当前 DSH 没有暴露插件管理接口', at: Date.now() }
+    savePluginUpdate()
+    return
+  }
+
+  const from = PLUGIN_VERSION
+  if (!update.pluginLatest) await checkUpdates().catch(() => {})
+  const to = update.pluginLatest
+  if (!hasNewer(to, from)) {
+    pluginUpdate = { ...pluginUpdate, status: 'failed', error: '已经是最新版本', from, to: to ?? null, at: Date.now() }
+    savePluginUpdate()
+    return
+  }
+  if (pluginInstall.kind !== 'npm') {
+    pluginUpdate = {
+      ...pluginUpdate, status: 'failed', from, to, at: Date.now(),
+      error: '不是 npm 安装的（' + pluginInstall.kind + '），需要手动卸载后重装',
+    }
+    savePluginUpdate()
+    return
+  }
+
+  const hot = refreshHmr()
+  pluginUpdate = {
+    status: hot ? 'removing' : 'installing', from, to, hot,
+    restartRequired: !hot, error: null, at: Date.now(), rollback: null,
+  }
+  savePluginUpdate()
+  sys(`▸ 更新启动器 ${from} → ${to}（${hot ? '热更新：先卸载再装回，不重启 DSH' : '当前 DSH 未开 HMR，装完需重启'}）`)
+
+  let removed = false
+  try {
+    if (hot) {
+      const result = await pm.removeBundle(PLUGIN_NAME)
+      const gone = result && result.application
+      if (!result || gone === 'failed' || gone === 'cancelled') {
+        const code = result && result.error && result.error.code
+        throw new Error(gone === 'cancelled' ? '卸载旧版被取消，插件没有动' : pmErrorText(code, '卸载旧版'))
+      }
+      removed = true
+      pluginUpdate = { ...pluginUpdate, status: 'installing', at: Date.now() }
+      savePluginUpdate()
+    }
+
+    const result = await pm.installBundle(`${PLUGIN_NAME}@${to}`, {})
+    const applied = result && result.application
+    if (!result || applied === 'failed' || applied === 'cancelled') {
+      const code = result && result.error && result.error.code
+      throw new Error(applied === 'cancelled' ? '安装被取消，插件文件已还原' : pmErrorText(code, '安装'))
+    }
+    // ChangeResult 不带版本号，装完回读一次，面板上显示的就是真实落盘版本
+    const installed = typeof pm.listBundles === 'function'
+      ? (await pm.listBundles()).find((item) => item && item.name === PLUGIN_NAME)
+      : null
+    pluginUpdate = {
+      ...pluginUpdate,
+      status: 'done',
+      to: (installed && typeof installed.version === 'string' && installed.version) || to,
+      restartRequired: applied === 'restart-required',
+      error: null,
+      at: Date.now(),
+    }
+    savePluginUpdate()
+    sys(result.application === 'restart-required'
+      ? `启动器已更新到 ${pluginUpdate.to}，重启 DSH 后生效`
+      : `启动器已更新到 ${pluginUpdate.to}（热更新完成，没有重启 DSH）`)
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    sys(`更新启动器失败：${message}`)
+    let rollback = null
+    // 已经卸掉了才需要救：把原版本装回去，用户至少还有一个能用的面板
+    if (removed) {
+      sys(`▸ 尝试回滚到 ${from}`)
+      try {
+        const back = await pm.installBundle(`${PLUGIN_NAME}@${from}`, {})
+        const backOk = back && back.application !== 'failed' && back.application !== 'cancelled'
+        rollback = backOk
+          ? `已回滚到 ${from}`
+          : pmErrorText(back && back.error && back.error.code, '回滚')
+      } catch (backError) {
+        rollback = `回滚失败：${backError && backError.message ? backError.message : String(backError)}`
+      }
+      sys(rollback)
+    }
+    pluginUpdate = {
+      ...pluginUpdate,
+      status: removed ? (rollback && rollback.startsWith('已回滚') ? 'rolled-back' : 'failed') : 'failed',
+      error: message,
+      rollback,
+      at: Date.now(),
+    }
+    savePluginUpdate()
+  }
+}
+
 /* ── 构建 ───────────────────────────────────────────────────────── */
 
 function startBuild() {
@@ -605,17 +1046,45 @@ function stopServer() {
 }
 
 function snapshot(sinceSeq) {
+  syncPluginUpdateFromDisk()
   const since = Number(sinceSeq ?? 0) || 0
   const fresh = logs.filter((entry) => entry.seq > since)
   return {
     projectRoot,
     projectValid: projectValid(),
     projectPackage: PROJECT_PACKAGE,
+    projectVersion: readProjectVersion(),
     defaultRegistry: DEFAULT_REGISTRY,
+    registry,
     install: { ...install },
     projectUpdate: { ...projectUpdate },
     pluginVersion: PLUGIN_VERSION,
-    pluginSource: PLUGIN_SOURCE,
+    pluginSource: pluginInstall.kind,
+    /** 插件自身的安装情况 + 能不能一键更新 + 走不走热更新 */
+    plugin: {
+      name: PLUGIN_NAME,
+      version: PLUGIN_VERSION,
+      kind: pluginInstall.kind,
+      spec: pluginInstall.spec,
+      removable: pluginInstall.removable,
+      managed: pluginInstall.managed,
+      canAutoUpdate: canAutoUpdate(),
+      hot: hmrLive,
+      manualSpec: reinstallSpec(),
+    },
+    /** 启动时静默查到的版本（面板顶部横幅用） */
+    update: {
+      checkedAt: update.checkedAt,
+      registry: update.registry,
+      latest: update.pluginLatest,
+      projectLatest: update.projectLatest,
+      hasUpdate: hasNewer(update.pluginLatest, PLUGIN_VERSION),
+      projectHasUpdate: hasNewer(update.projectLatest, readProjectVersion()),
+      error: update.error,
+    },
+    pluginUpdate: { ...pluginUpdate },
+    /** 连接器里直接粘贴的配置（stdio / http 两种） */
+    mcp: buildMcpConfig(),
     port,
     url: baseUrl(),
     healthy: lastHealthy,
@@ -664,6 +1133,8 @@ async function handle(req, res) {
     if (action === '/' || action === '/state') {
       if (method === 'GET') {
         await refreshHealth()
+        // 更新进行中时状态存在磁盘上（host 可能刚被 HMR 换过实例），每次读一下
+        if (updatingPlugin()) loadPluginUpdate()
         return reply(200, snapshot(url.searchParams.get('since')))
       }
     }
@@ -711,42 +1182,76 @@ async function handle(req, res) {
     if (action === '/install-project' && method === 'POST') {
       const body = await readJsonBody(req)
       const dir = String((body && body.dir) ?? '').trim()
-      const registry = String((body && body.registry) ?? DEFAULT_REGISTRY).trim()
+      const reg = String((body && body.registry) ?? registry).trim()
       if (install.status === 'running') return reply(409, { ok: false, error: '正在下载/安装中，请稍候' })
       if (serverProc) return reply(409, { ok: false, error: '服务运行中，先停止再安装工程' })
       if (!dir) return reply(400, { ok: false, error: '请选择下载目录' })
       if (!path.isAbsolute(dir)) return reply(400, { ok: false, error: '目录要填绝对路径' })
-      if (!/^https?:\/\//i.test(registry)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
+      if (!/^https?:\/\//i.test(reg)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
       // 异步跑，客户端靠轮询 state 看进度
-      void installProject({ dir, registry })
+      void installProject({ dir, registry: reg })
       return reply(200, { ok: true, ...snapshot(0) })
     }
     if (action === '/updates' && method === 'GET') {
-      const registry = (url.searchParams.get('registry') || DEFAULT_REGISTRY).trim()
-      if (!/^https?:\/\//i.test(registry)) {
+      const wanted = (url.searchParams.get('registry') || registry).trim()
+      if (!/^https?:\/\//i.test(wanted)) {
         return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
       }
-      const [pluginLatest, projectLatest] = await Promise.all([
-        fetchLatestVersion(PLUGIN_PACKAGE, registry),
-        fetchLatestVersion(PROJECT_PACKAGE, registry),
-      ])
+      const latest = await checkUpdates(wanted)
       return reply(200, {
         ok: true,
-        registry,
-        plugin: { name: PLUGIN_PACKAGE, current: PLUGIN_VERSION, latest: pluginLatest },
-        project: { name: PROJECT_PACKAGE, current: readProjectVersion(), latest: projectLatest },
+        registry: wanted,
+        checkedAt: latest.checkedAt,
+        plugin: {
+          name: PLUGIN_NAME,
+          current: PLUGIN_VERSION,
+          latest: latest.pluginLatest,
+          kind: pluginInstall.kind,
+          canAutoUpdate: canAutoUpdate(),
+          hot: hmrLive,
+        },
+        project: { name: PROJECT_PACKAGE, current: readProjectVersion(), latest: latest.projectLatest },
+        error: latest.error,
       })
+    }
+    if (action === '/plugin-update' && method === 'POST') {
+      if (updatingPlugin()) return reply(409, { ok: false, error: '正在更新启动器，稍等它装完' })
+      if (!pluginManager) {
+        return reply(409, { ok: false, error: '当前 DSH 没有暴露插件管理接口，请到「设置 → 插件」里更新' })
+      }
+      await refreshPluginInstall()
+      if (pluginInstall.kind !== 'npm') {
+        return reply(409, {
+          ok: false,
+          error: `当前是 ${pluginInstall.kind} 安装，只能手动卸载后重装`,
+        })
+      }
+      if (!pluginInstall.removable) {
+        return reply(409, { ok: false, error: 'DSH 不允许直接卸载这个插件（可能随安装包自带），请到「设置 → 插件」处理' })
+      }
+      if (!update.pluginLatest) await checkUpdates().catch(() => {})
+      if (!hasNewer(update.pluginLatest, PLUGIN_VERSION)) {
+        return reply(409, { ok: false, error: '已经是最新版本' })
+      }
+      // 先把响应发回去再动插件：热更新第一步就会把这个面板自己卸掉
+      setTimeout(() => { void runPluginUpdate() }, 80)
+      return reply(202, { ok: true, ...snapshot(0) })
+    }
+    if (action === '/plugin-update/ack' && method === 'POST') {
+      // 面板把「更新完成 / 失败」看过了，清掉标记，下次不再弹
+      clearPluginUpdate()
+      return reply(200, { ok: true, pluginUpdate: { ...pluginUpdate } })
     }
     if (action === '/update-project' && method === 'POST') {
       const body = await readJsonBody(req)
-      const registry = String((body && body.registry) ?? DEFAULT_REGISTRY).trim()
-      if (!/^https?:\/\//i.test(registry)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
+      const reg = String((body && body.registry) ?? registry).trim()
+      if (!/^https?:\/\//i.test(reg)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
       if (projectUpdate.status === 'running' || install.status === 'running') {
         return reply(409, { ok: false, error: '正在安装/更新工程，请稍候' })
       }
       if (serverProc) return reply(409, { ok: false, error: '服务运行中，先停止再更新工程' })
       if (!projectValid()) return reply(409, { ok: false, error: '还没有工程，先用「安装」' })
-      void updateProject({ registry })
+      void updateProject({ registry: reg })
       return reply(200, { ok: true, ...snapshot(0) })
     }
     if (action === '/stop' && method === 'POST') {
@@ -789,6 +1294,19 @@ async function handle(req, res) {
         return reply(200, { ok: saved, panelPos })
       }
     }
+    if (action === '/registry') {
+      if (method === 'GET') return reply(200, { ok: true, registry })
+      if (method === 'POST') {
+        const body = await readJsonBody(req)
+        const next = String((body && body.registry) ?? '').trim()
+        if (!/^https?:\/\//i.test(next)) return reply(400, { ok: false, error: '下载源要是 http(s) 地址' })
+        registry = next
+        persist()
+        // 换源之后顺手用新源重查一次，免得面板里还挂着旧源的结果
+        await checkUpdates(next).catch(() => {})
+        return reply(200, { ok: true, registry, ...snapshot(0) })
+      }
+    }
     if (action === '/port') {
       if (method === 'GET') return reply(200, { ok: true, port })
       if (method === 'POST') {
@@ -822,9 +1340,12 @@ export const name = 'dsh-remotion-launcher'
 export const inject = ['webServer']
 
 export function apply(ctx) {
+  hostCtx = ctx
   loadPersisted()
+  loadPluginUpdate()
   sys(`按钮位置文件：${SETTINGS_FILE}${fabPos ? `（已恢复 ${fabPos.x},${fabPos.y}）` : '（尚未拖动过）'}`)
   sys(`运行端口：${port}${PORT_FROM_ENV ? '（来自环境变量 REMOTION_PORT）' : '（可在面板中修改）'}`)
+  sys(`下载源：${registry}`)
 
   if (projectValid()) {
     sys(`插件已加载，工程目录：${projectRoot}`)
@@ -832,6 +1353,39 @@ export function apply(ctx) {
     sys(`插件已加载，但还没找到工程：${projectRoot}`)
     sys(`  可以在面板里「下载项目」：选目录 + 下载源，会自动 npm pack → 解压 → npm install（包名 ${PROJECT_PACKAGE}）。`)
     sys('  也可以手动把工程放到某个目录，然后设 REMOTION_STUDIO_ROOT 指过去。')
+  }
+
+  // 上一次更新走到一半（HMR 换实例时也会走到这里）：把结果说清楚
+  if (pluginUpdate.status === 'done') {
+    sys(`上次更新已完成：${pluginUpdate.from} → ${pluginUpdate.to}${pluginUpdate.restartRequired ? '（需重启 DSH 生效）' : '（热更新）'}`)
+  } else if (pluginUpdate.status === 'interrupted') {
+    sys(`上次更新没有走完：${pluginUpdate.error ?? ''}`)
+  } else if (pluginUpdate.status === 'rolled-back' || pluginUpdate.status === 'failed') {
+    sys(`上次更新失败：${pluginUpdate.error ?? ''}${pluginUpdate.rollback ? `（${pluginUpdate.rollback}）` : ''}`)
+  }
+
+  /**
+   * 按需拿插件管理服务。
+   *
+   * 不能写进 `inject`：headless / SDK 部署里可能根本没有插件管理，写进 inject
+   * 会让整个面板等到天荒地老都不出现。`ctx.inject` 是「有服务就回调」。
+   */
+  try {
+    const register = () => {
+      ctx.inject(['pluginManager'], (svcCtx) => {
+        try {
+          pluginManager = svcCtx.pluginManager ?? null
+        } catch {
+          pluginManager = null
+        }
+        refreshHmr()
+        void refreshPluginInstall()
+        return () => { pluginManager = null; void refreshPluginInstall() }
+      })
+    }
+    if (typeof ctx.inject === 'function') register()
+  } catch {
+    /* 环境不支持动态注入：保持 null，面板里会提示手动更新 */
   }
 
   ctx.effect(() => {
@@ -845,6 +1399,30 @@ export function apply(ctx) {
 
   // 启动时探一次：服务是不是已经跑着（上次没关干净 / 用户手动开的）
   refreshHealth().catch(() => {})
+
+  /**
+   * 启动后静默查一次版本。
+   *
+   * 延迟 3 秒再发：别和 DSH 自己的启动流程抢网络；查到了也不弹任何东西，
+   * 只是把结果放进 state —— 悬浮按钮上出一个小圆点，面板顶部出一行横幅。
+   * 查不到（离线 / 镜像是旧的）就安静地留着 error，不打扰用户。
+   */
+  const silentTimer = setTimeout(() => {
+    void (async () => {
+      try {
+        refreshHmr()
+        await refreshPluginInstall()
+        const result = await checkUpdates()
+        if (hasNewer(result.pluginLatest, PLUGIN_VERSION)) {
+          sys(`发现启动器新版本 ${result.pluginLatest}（当前 ${PLUGIN_VERSION}，${pluginInstall.kind} 安装）`)
+        }
+      } catch {
+        /* 静默检查失败不问用户 */
+      }
+    })()
+  }, 3000)
+  if (typeof silentTimer.unref === 'function') silentTimer.unref()
+  ctx.effect(() => () => clearTimeout(silentTimer), 'dsh-remotion-launcher: update-check')
 
   // 插件卸载 / DSH 退出时收尸，避免端口被孤儿进程占着
   ctx.effect(() => {

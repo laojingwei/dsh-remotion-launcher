@@ -198,6 +198,94 @@ check('GET /updates 返回启动器与工程的版本', () => {
   console.log(`      工程   ${body.project.current ?? '—'} → ${body.project.latest ?? '（查询失败/离线）'}`)
 })
 
+/* ── 下载源：读写 + 校验（换源后用本机死端口，避免真联网） ── */
+const regRead = await request('GET', '/remotion-plugin/registry')
+check('GET /registry 返回当前下载源', () => {
+  if (regRead.status !== 200) throw new Error(`HTTP ${regRead.status} ${regRead.body}`)
+  const body = JSON.parse(regRead.body)
+  if (!/^https?:\/\//i.test(body.registry ?? '')) throw new Error(`下载源不对：${body.registry}`)
+})
+
+const regBad = await request('POST', '/remotion-plugin/registry', JSON.stringify({ registry: 'ftp://x' }))
+check('POST /registry 拒绝非 http(s) 源', () => {
+  if (regBad.status !== 400) throw new Error(`期望 400，实际 ${regBad.status}`)
+})
+
+const regOk = await request('POST', '/remotion-plugin/registry',
+  JSON.stringify({ registry: 'http://127.0.0.1:9' }))
+check('POST /registry 保存并落盘', () => {
+  if (regOk.status !== 200) throw new Error(`HTTP ${regOk.status} ${regOk.body}`)
+  const body = JSON.parse(regOk.body)
+  if (body.registry !== 'http://127.0.0.1:9') throw new Error(`回显不符：${body.registry}`)
+  const onDisk = JSON.parse(fs.readFileSync(path.join(scratch, 'remotion-launcher.json'), 'utf8'))
+  if (onDisk.registry !== 'http://127.0.0.1:9') throw new Error(`没落盘：${JSON.stringify(onDisk)}`)
+  if (onDisk.fabPos?.x !== 321) throw new Error('写下载源时把按钮位置弄丢了')
+})
+
+/* ── 启动器更新：没有插件管理接口时必须明确拒绝，而不是假装在更新 ── */
+const updState = await request('GET', '/remotion-plugin/state?since=0')
+check('GET /state 带启动器版本/安装方式/更新状态', () => {
+  const body = JSON.parse(updState.body)
+  for (const key of ['plugin', 'update', 'pluginUpdate', 'registry']) {
+    if (!(key in body)) throw new Error(`快照缺字段 ${key}`)
+  }
+  const plugin = body.plugin
+  for (const key of ['name', 'version', 'kind', 'canAutoUpdate', 'hot', 'manualSpec']) {
+    if (!(key in plugin)) throw new Error(`plugin 缺字段 ${key}`)
+  }
+  for (const key of ['checkedAt', 'latest', 'hasUpdate', 'error']) {
+    if (!(key in body.update)) throw new Error(`update 缺字段 ${key}`)
+  }
+  if (body.pluginUpdate.status !== 'idle') throw new Error(`初始更新状态应为 idle，实际 ${body.pluginUpdate.status}`)
+  console.log(`      启动器 ${plugin.version}（${plugin.kind}）  热更新可用：${plugin.hot}`)
+  console.log(`      静默检查：${body.update.checkedAt ? new Date(body.update.checkedAt).toLocaleTimeString() : '未检查'}  新版：${body.update.latest ?? '—'}`)
+})
+
+check('GET /state 带可直接粘贴的 MCP 配置', () => {
+  const body = JSON.parse(updState.body)
+  const mcp = body.mcp
+  if (!mcp || typeof mcp !== 'object') throw new Error('快照缺 mcp')
+
+  const entry = mcp.stdio?.mcpServers?.['remotion-studio']
+  if (!entry) throw new Error('stdio 配置缺 remotion-studio')
+  if (entry.command !== 'node') throw new Error(`stdio 命令应为 node，实际 ${entry.command}`)
+  if (!Array.isArray(entry.args) || entry.args.length !== 2) throw new Error('stdio 需要两个参数（tsx + 代理）')
+  for (const arg of entry.args) {
+    if (!path.isAbsolute(arg)) throw new Error(`stdio 参数要绝对路径：${arg}`)
+    if (arg.includes('\\')) throw new Error(`JSON 里的路径要用正斜杠：${arg}`)
+  }
+  if (!entry.args[0].endsWith('/node_modules/tsx/dist/cli.mjs')) throw new Error(`tsx 入口不对：${entry.args[0]}`)
+  if (!entry.args[1].endsWith('/server/mcp-proxy.ts')) throw new Error(`代理入口不对：${entry.args[1]}`)
+
+  const http = mcp.http?.mcpServers?.['remotion-studio']
+  if (!http) throw new Error('http 配置缺 remotion-studio')
+  if (http.type !== 'http') throw new Error(`http.type 应为 http，实际 ${http.type}`)
+  if (!/\/mcp$/.test(http.url)) throw new Error(`HTTP 端点要带 /mcp：${http.url}`)
+  if (!http.url.includes(`:${body.port}`)) throw new Error(`HTTP 端点端口应与面板一致：${http.url} vs ${body.port}`)
+  if (entry.env?.SERVER_URL !== mcp.serverUrl) throw new Error('env.SERVER_URL 与 serverUrl 不一致')
+
+  // stdio 要工程依赖装齐才算就绪；没装就报 false，别给假绿灯
+  if (typeof mcp.stdioReady !== 'boolean' || typeof mcp.httpReady !== 'boolean') {
+    throw new Error('ready 标记要是布尔')
+  }
+  console.log(`      stdio 就绪：${mcp.stdioReady}  HTTP 就绪：${mcp.httpReady}  端点：${http.url}`)
+})
+
+const noPm = await request('POST', '/remotion-plugin/plugin-update')
+check('POST /plugin-update 无插件管理接口时 409 并说清原因', () => {
+  if (noPm.status !== 409) throw new Error(`期望 409，实际 ${noPm.status}`)
+  const body = JSON.parse(noPm.body)
+  if (body.ok !== false) throw new Error('ok 应为 false')
+  if (!/插件管理/.test(body.error ?? '')) throw new Error(`错误信息不够具体：${body.error}`)
+})
+
+const acked = await request('POST', '/remotion-plugin/plugin-update/ack')
+check('POST /plugin-update/ack 清空更新标记', () => {
+  if (acked.status !== 200) throw new Error(`HTTP ${acked.status} ${acked.body}`)
+  const body = JSON.parse(acked.body)
+  if (body.pluginUpdate?.status !== 'idle') throw new Error(`状态没清干净：${JSON.stringify(body.pluginUpdate)}`)
+})
+
 /* ── 换工程目录：只测校验，不真的切 ── */
 const useMissing = await request('POST', '/remotion-plugin/use-project', JSON.stringify({ dir: '' }))
 check('POST /use-project 缺目录返回 400', () => {
