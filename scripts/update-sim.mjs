@@ -17,6 +17,8 @@ import path from 'node:path'
 
 const scratch = path.join(os.tmpdir(), `dsh-remotion-launcher-update-${process.pid}`)
 process.env.DSH_HOME = scratch
+/** 没有真 HMR 会拉起新实例，等待只会让测试变慢；接管用例自己把证据写进标记文件 */
+process.env.DSH_REMOTION_BOOT_WAIT_MS = '0'
 fs.rmSync(scratch, { recursive: true, force: true })
 
 /* ── 本地假 registry：只认 /<pkg>/latest ── */
@@ -42,6 +44,7 @@ const fakePm = {
   removable: true,
   version: '1.0.6',
   failInstallOf: null,
+  simulateBoot: false,
   async listBundles() {
     return [{
       name: 'dsh-remotion-launcher',
@@ -62,6 +65,17 @@ const fakePm = {
     }
     // 真的把包装上：后面 listBundles 回读到的版本要跟着变
     fakePm.version = spec.slice(spec.lastIndexOf('@') + 1)
+    /**
+     * 模拟「HMR 真的把新实例拉起来了」：真机上这一步是新实例的 apply() 干的，
+     * 它会把自己是在跑的版本写进标记文件，旧实例据此确认接管。
+     */
+    if (fakePm.simulateBoot) {
+      const marker = path.join(scratch, 'remotion-launcher-update.json')
+      const raw = JSON.parse(fs.readFileSync(marker, 'utf8'))
+      fs.writeFileSync(marker, `${JSON.stringify({
+        ...raw, status: 'done', bootedAt: Date.now(), bootedVersion: fakePm.version,
+      }, null, 2)}\n`, 'utf8')
+    }
     return { changed: true, application: 'applied', stage: 'install', target: spec }
   },
 }
@@ -244,6 +258,27 @@ check('无 HMR 时不卸载，装完仍要求重启', () => {
   if (!pu.restartRequired) throw new Error('装完应要求重启')
   console.log(`      装到 ${pu.to}，等重启（运行中 ${noHmr.plugin.version}）`)
 })
+
+/* ── 5. HMR 真把新实例拉起来了：判为热更新成功，不必重启 ── */
+await request('POST', '/remotion-plugin/plugin-update/ack')
+fakePm.failInstallOf = null
+hmrPresent = true
+latestVersion = '9.9.12'
+fakePm.simulateBoot = true
+calls.length = 0
+await request('POST', '/remotion-plugin/plugin-update')
+await new Promise((resolve) => setTimeout(resolve, 500))
+const booted = await state()
+check('新实例接管时判为热更新成功，不再要求重启', () => {
+  const pu = booted.pluginUpdate
+  if (pu.status !== 'done') throw new Error(`状态应为 done，实际 ${pu.status}（${pu.error ?? ''}）`)
+  if (pu.restartRequired) throw new Error('新实例已接管，不该要求重启')
+  if (!pu.bootedAt) throw new Error('应记下新实例接管时间 bootedAt')
+  if (pu.bootedVersion !== latestVersion) throw new Error(`接管版本应为 ${latestVersion}，实际 ${pu.bootedVersion}`)
+  if (!pu.dsr || pu.dsr.application !== 'applied') throw new Error('应记下 DSH 给出的 application')
+  console.log(`      ${pu.from} → ${pu.to}　热更新已接管（可确认 DSH 真的换了新代码）`)
+})
+fakePm.simulateBoot = false
 
 registry.close()
 fs.rmSync(scratch, { recursive: true, force: true })

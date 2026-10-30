@@ -712,12 +712,22 @@ function reinstallSpec() {
  */
 const UPDATE_MARKER_FILE = path.join(STATE_DIR, 'remotion-launcher-update.json')
 
+/**
+ * 等「新实例接管」的最长时间。
+ *
+ * 热更新成功时，DSH 会重新 import 这个包并再跑一遍 apply()，新实例会在标记文件里
+ * 写上 bootedAt；等不到就只能认为它没接管。测试里设 0 跳过等待。
+ */
+const BOOT_WAIT_MS = Number(process.env.DSH_REMOTION_BOOT_WAIT_MS ?? 3000) || 0
+
 /** @type {{status:'idle'|'removing'|'installing'|'done'|'failed'|'rolled-back'|'interrupted',
  *          from:string|null,to:string|null,hot:boolean,restartRequired:boolean,
- *          error:string|null,at:number|null,rollback:string|null}} */
+ *          error:string|null,at:number|null,rollback:string|null,
+ *          bootedAt:number|null,bootedVersion:string|null,dsr:{application:string,restartReason:string|null}|null}} */
 let pluginUpdate = {
   status: 'idle', from: null, to: null, hot: false,
   restartRequired: false, error: null, at: null, rollback: null,
+  bootedAt: null, bootedVersion: null, dsr: null,
 }
 
 function savePluginUpdate() {
@@ -737,14 +747,24 @@ function loadPluginUpdate() {
     const at = Number(raw.at) || stat.mtimeMs
     const target = typeof raw.to === 'string' ? raw.to : null
     /**
-     * 标记里的目标版本就是这次进程正在跑的版本 —— 更新真的生效了。
-     * 不管是「上次没走完」还是「待重启」，都不该再挂出来，直接清档。
+     * 标记里的目标版本就是本进程正在跑的版本 ⇒ 这次 import 出来的就是新代码。
+     *
+     * 这就是「热更新到底成没成」的判定依据：装机时会写 removing/installing，
+     * 只有真正被重新拉起的那份新代码会看到「to = 自己」。
+     * 这里不删档：留在盘上，旧实例还在跑的 async 流程靠它确认「新实例已接管」。
      */
-    if (target && target === PLUGIN_VERSION && raw.status !== 'failed') {
+    if (target && target === PLUGIN_VERSION && (raw.status === 'removing' || raw.status === 'installing')) {
       pluginUpdate = {
-        status: 'done', from: raw.from ?? null, to: target, hot: raw.hot === true,
-        restartRequired: false, error: null, at, rollback: null,
+        status: 'done', from: raw.from ?? null, to: target, hot: true,
+        restartRequired: false, error: null, at,
+        rollback: null, bootedAt: Date.now(), bootedVersion: PLUGIN_VERSION, dsr: raw.dsr ?? null,
       }
+      savePluginUpdate()
+      sys(`启动器 ${PLUGIN_VERSION} 已接管：上次更新的新代码跑起来了（无需重启）`)
+      return
+    }
+    if (target && target === PLUGIN_VERSION && raw.status !== 'failed') {
+      // 上次那次更新已经生效并确认过，别每次启动都再提一遍
       try { fs.rmSync(UPDATE_MARKER_FILE, { force: true }) } catch { /* ignore */ }
       return
     }
@@ -774,8 +794,36 @@ function clearPluginUpdate() {
   pluginUpdate = {
     status: 'idle', from: null, to: null, hot: false,
     restartRequired: false, error: null, at: null, rollback: null,
+    bootedAt: null, bootedVersion: null, dsr: null,
   }
   try { fs.rmSync(UPDATE_MARKER_FILE, { force: true }) } catch { /* ignore */ }
+}
+
+/**
+ * 等「新实例接管」的证据：标记文件里出现 bootedAt ≥ since 且版本等于目标版本。
+ *
+ * 这是唯一能证明「新代码真的在跑」的信号 —— 比 ChangeResult.application 可信：
+ * 那个字段只说文件写成了，HMR 到底有没有把新模块拉起来，只有新实例自己知道。
+ * @param {string} to 目标版本
+ * @param {number} since 开装时间
+ * @param {number} timeout 最多等多久
+ */
+async function waitForBoot(to, since, timeout) {
+  const deadline = Date.now() + Math.max(0, timeout)
+  const bootedNow = () => {
+    try {
+      const raw = JSON.parse(fs.readFileSync(UPDATE_MARKER_FILE, 'utf8'))
+      return Boolean(raw && raw.bootedVersion === to && Number(raw.bootedAt) >= since)
+    } catch {
+      return false
+    }
+  }
+  for (;;) {
+    // 先看一次：新实例可能早就写好了，不必等到超时
+    if (bootedNow()) return true
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, 120))
+  }
 }
 
 /**
@@ -867,9 +915,12 @@ async function runPluginUpdate() {
   }
 
   const hot = refreshHmr()
+  /** 从这一刻起，标记文件里出现的 bootedAt 才算「这次更新拉起来的新实例」 */
+  const startedAt = Date.now()
   pluginUpdate = {
     status: hot ? 'removing' : 'installing', from, to, hot,
-    restartRequired: true, error: null, at: Date.now(), rollback: null,
+    restartRequired: true, error: null, at: startedAt, rollback: null,
+    bootedAt: null, bootedVersion: null, dsr: null,
   }
   savePluginUpdate()
   sys(`▸ 更新启动器 ${from} → ${to}（${hot ? '先卸载再装回' : '当前 DSH 未开 HMR'}，装完要重启 DSH 才生效）`)
@@ -894,35 +945,41 @@ async function runPluginUpdate() {
       const code = result && result.error && result.error.code
       throw new Error(applied === 'cancelled' ? '安装被取消，插件文件已还原' : pmErrorText(code, '安装'))
     }
+    /** DSH 自己的说法：applied 还是 restart-required，以及要重启的原因 */
+    const dsr = { application: applied, restartReason: (result && result.restartReason) || null }
     // ChangeResult 不带版本号，装完回读一次，面板上显示的就是真实落盘版本
     const installedRow = typeof pm.listBundles === 'function'
       ? (await pm.listBundles()).find((item) => item && item.name === PLUGIN_NAME)
       : null
     const landed = (installedRow && typeof installedRow.version === 'string' && installedRow.version) || to
     /**
-     * 「装上了」不等于「跑起来了」。
-     *
-     * PLUGIN_VERSION 是本进程启动时读到的，装完不会变；DSH 的 HMR 能换客户端模块，
-     * 换不掉已经被 import 的主进程半部（reload 的 restartReason 就是 host-module）。
-     * 所以判定标准是「落盘版本 vs 运行版本」，不看 ChangeResult 的 applied ——
-     * 它只说明档案写成了，不代表这份代码在跑。
+     * 本进程的 PLUGIN_VERSION 装完不会变，所以「有没有真的换上新代码」只有两条证据：
+     * 标记文件里出现新实例的 bootedAt（HMR 真的把它拉起来了），或 DSH 自己说不用重启。
+     * 两条都没有就老实说「要重启」——不要拿 ChangeResult 的 applied 当已生效。
      */
-    const needsRestart = landed !== PLUGIN_VERSION
+    const booted = hot ? await waitForBoot(to, startedAt, BOOT_WAIT_MS) : false
+    const needsRestart = !booted && (landed !== PLUGIN_VERSION || applied === 'restart-required')
     pluginUpdate = {
       ...pluginUpdate,
       status: 'done',
       to: landed,
-      restartRequired: needsRestart || applied === 'restart-required',
+      restartRequired: needsRestart,
       error: null,
       rollback: null,
       at: Date.now(),
+      bootedAt: booted ? Date.now() : null,
+      bootedVersion: booted ? landed : null,
+      dsr,
     }
     // 让面板上的「已安装版本」立刻跟上，不必等下一次 listBundles
     pluginInstall = { ...pluginInstall, version: landed }
     savePluginUpdate()
-    sys(pluginUpdate.restartRequired
-      ? `启动器已装到 ${landed}，重启 DSH 后生效（当前运行 ${PLUGIN_VERSION}）`
-      : `启动器已更新到 ${landed}，已生效`)
+    const why = dsr.restartReason ? `（DSH 原因：${dsr.restartReason}）` : ''
+    sys(booted
+      ? `启动器已热更新到 ${landed}：新实例已接管，不用重启`
+      : needsRestart
+        ? `启动器已装到 ${landed}，重启 DSH 后生效（当前运行 ${PLUGIN_VERSION}）${why}`
+        : `启动器已更新到 ${landed}，已生效`)
   } catch (error) {
     const message = error && error.message ? error.message : String(error)
     sys(`更新启动器失败：${message}`)
@@ -1419,7 +1476,10 @@ export function apply(ctx) {
 
   // 上一次更新走到一半（HMR 换实例时也会走到这里）：把结果说清楚
   if (pluginUpdate.status === 'done') {
-    sys(`上次更新已完成：${pluginUpdate.from} → ${pluginUpdate.to}${pluginUpdate.restartRequired ? '（需重启 DSH 生效）' : '（热更新）'}`)
+    const how = pluginUpdate.bootedAt
+      ? '热更新已接管，没重启'
+      : pluginUpdate.restartRequired ? '需重启 DSH 生效' : '已生效'
+    sys(`上次更新已完成：${pluginUpdate.from} → ${pluginUpdate.to}（${how}）`)
   } else if (pluginUpdate.status === 'interrupted') {
     sys(`上次更新没有走完：${pluginUpdate.error ?? ''}`)
   } else if (pluginUpdate.status === 'rolled-back' || pluginUpdate.status === 'failed') {

@@ -1338,7 +1338,9 @@ window.__ModuleLoader__.load({
               h('span', { key: 'a', style: { ...S.bannerTitle, color: '#c9f7d8' } },
                 `已更新到 ${pu.to || pluginVer}`),
               h('span', { key: 'b', style: S.bannerDetail },
-                pu.restartRequired ? '重启 DSH 后生效' : '已经在运行新版本'),
+                pu.bootedAt
+                  ? '新实例已接管，没重启 DSH'
+                  : pu.restartRequired ? '重启 DSH 后生效' : '已经在运行新版本'),
             ]),
             h(ActButton, { key: 'x', variant: 'mini', onClick: ackPluginUpdate }, '知道了'),
           ]);
@@ -1408,7 +1410,7 @@ window.__ModuleLoader__.load({
             }, confirmUpdate ? '再点一次确认更新' : (pluginUpdating ? '更新中…' : '一键更新启动器')),
             h('div', { key: 'h', style: S.hint },
               hotUpdate
-                ? '会先卸载再用新版装回来。DSH 只能热换界面代码，主进程那份要重启才重新加载，所以装完请重启一次。'
+                ? '会先卸载再用新版装回来。DSH 能把新代码热换进来就自动生效；换不掉会当场告诉你需要重启，不会含糊。'
                 : '当前 DSH 没开 HMR：会装上最新版，装完需要重启 DSH 才生效。'),
           ]));
         } else if (pendingRestart) {

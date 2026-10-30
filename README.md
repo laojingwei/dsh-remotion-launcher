@@ -165,22 +165,26 @@ dsh plugin --profile web remove dsh-remotion-launcher
 dsh plugin --profile web add github:laojingwei/dsh-remotion-launcher
 ```
 
-### 一键更新：装完要重启 DSH
+### 一键更新：能热换就热换，换不掉才让你重启
 
 npm 安装的插件走 DSH 自己的插件管理接口，一次点击完成「卸旧 → 装新」：
 
 ```
-removeBundle(旧版)  →  installBundle(新版)  →  重启 DSH 生效
+removeBundle(旧版)  →  installBundle(新版)  →  新实例接管？
+                                              ├─ 是：已完成，没重启
+                                              └─ 否：已装好，重启 DSH 生效
 ```
 
-- 装完顶部显示绿色「已装好 x.y.z　重启 DSH 后生效」，并标出当前运行的还是哪个版本
-- **不谎称热更新**：DSH 的 HMR 只能换客户端模块，插件主进程那份（`index.js`）已经被 import 在内存里，`reload()` 会以 `restartReason: host-module` 要求重启。所以判定标准是「落盘版本 vs 运行版本」，不看 `ChangeResult` 的 `applied`——它只说明档案写成了，不代表这份代码在跑
+- **判定不靠 DSH 的口头承诺**：`ChangeResult.application` 只说明文件写成了，HMR 到底有没有把新代码拉起来，要靠「新实例握手」——装机前在 `~/.dsh/remotion-launcher-update.json` 里写 `installing`，真正跑起来的那份代码会在 `apply()` 时发现「标记里的目标版本 = 自己」，于是回写 `bootedAt`。旧实例等这条证据，等到就是热更新成功，等不到就是需要重启
+- 两种情况面板都如实显示：「已更新到 x.y.z（新实例已接管，没重启 DSH）」或「已装好 x.y.z，重启 DSH 后生效，当前运行 a.b.c」，需要重启时还会带上 DSH 给的原因（`host-module` / `package-moved` / `unmanaged-plugin` / `module-comparison`）
 - 装完再点更新不会再装一遍，直接告诉你「已经装好，重启生效」
 - 卸载后装不上会自动**回滚到开装前盘上那版**，不会把已经装好的新版降回去，也不会让你面对一个消失的插件
-- 进度写在 `~/.dsh/remotion-launcher-update.json`：DSH 中途退出，下次启动会认出「上次没走完」；如果那次其实装成了（目标版本 = 当前运行版本），则直接清档不再提
+- 进度写在同一个标记文件里：DSH 中途退出，下次启动会认出「上次没走完」；确认生效后自动清档
 - 宿主没开 HMR 时不做卸载，直接装新版，同样提示重启才生效
 
 > 为什么必须先卸再装：HMR 开着时对一个已安装的包直接 `installBundle`，DSH 会以 `already-installed` 拒绝——覆盖一个正在跑的包会把旧实例留在内存里。
+
+> 环境变量 `DSH_REMOTION_BOOT_WAIT_MS` 可调等待新实例接管的毫秒数（默认 3000），测试里设 0 跳过等待。
 
 ## 配置
 
